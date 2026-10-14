@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -57,6 +58,10 @@ type scriptedChatTransport struct {
 	// resetBodyByAuth maps token -> bytes to emit before the stream is torn
 	// down (empty = reset before any frame). Response is 200 + SSE headers.
 	resetBodyByAuth map[string]string
+	// rawBodyByAuth maps token -> exact SSE body to return with 200 + SSE
+	// headers (used to replay upstream "polite" terminations: finish frames,
+	// empty content, zeroed usage).
+	rawBodyByAuth map[string]string
 }
 
 // resetReader yields `data` then fails with `reset`: an upstream connection
@@ -125,7 +130,19 @@ func (t *scriptedChatTransport) RoundTrip(req *http.Request) (*http.Response, er
 	}
 	status := t.byAuth[token]
 	resetData, reset := t.resetBodyByAuth[token]
+	raw, rawOK := t.rawBodyByAuth[token]
 	t.mu.Unlock()
+	if rawOK {
+		header := make(http.Header)
+		header.Set("Content-Type", "text/event-stream")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     http.StatusText(http.StatusOK),
+			Header:     header,
+			Body:       io.NopCloser(strings.NewReader(raw)),
+			Request:    req,
+		}, nil
+	}
 	if reset {
 		header := make(http.Header)
 		header.Set("Content-Type", "text/event-stream")
@@ -483,6 +500,92 @@ func TestCompleteFromPoolResetsReplayBudget(t *testing.T) {
 	chat, _ := transport.snapshot()
 	if len(chat) != 3 {
 		t.Fatalf("reset chain must stop at 1 original + %d replays, calls=%v", maxResetReplays, chat)
+	}
+}
+
+// sseEmptyFinish is the soft-truncation fingerprint: upstream terminates the
+// stream "politely" (finish_reason=stop + [DONE]) with zero content.
+const sseEmptyFinish = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+
+func TestCompleteFromPoolReplaysOnceAfterEmptyCompletedTurn(t *testing.T) {
+	dir := t.TempDir()
+	svc := New(config.Config{Site: "domestic", AccountsPath: dir + "/accounts.json"}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { _ = svc.Close() })
+	a, _, err := svc.Pool.Upsert(accounts.CreateAccount(accounts.Account{
+		Label: "a", Site: "domestic", BearerToken: "token-a", Enabled: true,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _, err := svc.Pool.Upsert(accounts.CreateAccount(accounts.Account{
+		Label: "b", Site: "domestic", BearerToken: "token-b", Enabled: true,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.ID == b.ID {
+		t.Fatal("fixture accounts must differ")
+	}
+	// token-a: empty completed turn (soft truncation); token-b: healthy.
+	transport := &scriptedChatTransport{rawBodyByAuth: map[string]string{"token-a": sseEmptyFinish}}
+	svc.Provider.HTTP = &http.Client{Transport: transport}
+
+	result, err := svc.CompleteFromPool(context.Background(), CompleteOptions{
+		Model: "auto", SessionKey: "conv-empty-replay",
+		Messages: []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("expected replay success after empty turn, got %v", err)
+	}
+	if result.AccountID != b.ID {
+		t.Fatalf("AccountID=%s want %s after empty-turn replay", result.AccountID, b.ID)
+	}
+	chat, _ := transport.snapshot()
+	if len(chat) != 2 || chat[0] != "token-a" || chat[1] != "token-b" {
+		t.Fatalf("chat calls=%v want [token-a token-b]", chat)
+	}
+}
+
+func TestEmptyCompletedTurnReplayIsBoundedToOne(t *testing.T) {
+	dir := t.TempDir()
+	svc := New(config.Config{Site: "domestic", AccountsPath: dir + "/accounts.json"}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { _ = svc.Close() })
+	for _, tok := range []string{"token-a", "token-b", "token-c"} {
+		if _, _, err := svc.Pool.Upsert(accounts.CreateAccount(accounts.Account{
+			Label: tok, Site: "domestic", BearerToken: tok, Enabled: true,
+		})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Every account returns the empty completed turn: exactly ONE switch
+	// replay is allowed, then the error surfaces (empty completions recur;
+	// chaining all accounts only burns time).
+	transport := &scriptedChatTransport{rawBodyByAuth: map[string]string{
+		"token-a": sseEmptyFinish,
+		"token-b": sseEmptyFinish,
+		"token-c": sseEmptyFinish,
+	}}
+	svc.Provider.HTTP = &http.Client{Transport: transport}
+
+	_, err := svc.CompleteFromPool(context.Background(), CompleteOptions{
+		Model: "auto", SessionKey: "conv-empty-bounded",
+		Messages: []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if err == nil {
+		t.Fatal("expected error after bounded replay")
+	}
+	if !strings.Contains(err.Error(), "empty completed turn") {
+		t.Fatalf("error must carry the empty-turn marker, got %v", err)
+	}
+	// Regression guard: the error string feeds Contains-based classifiers
+	// (11101/11140/429/502...). Any run of 3+ digits could forge a match, so
+	// diagnostic counters must live in logs, never in this string.
+	if m := regexp.MustCompile(`\d{3,}`).FindString(err.Error()); m != "" {
+		t.Fatalf("empty-turn error must not embed numeric runs (classifier substring hazard): %q in %v", m, err)
+	}
+	chat, _ := transport.snapshot()
+	if len(chat) != 2 {
+		t.Fatalf("chat calls=%v want exactly 2 attempts (one switch, no cascade)", chat)
 	}
 }
 

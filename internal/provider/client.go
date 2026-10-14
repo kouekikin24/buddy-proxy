@@ -114,6 +114,21 @@ type Turn struct {
 	Usage      Usage
 }
 
+// isEmptyCompletedTurn reports a "politely closed but empty" turn: the
+// stream ended normally (no error frames, a termination signal) yet
+// carries neither text nor tool calls. Content filter / refusal are
+// legitimate silences and stay exempt.
+func isEmptyCompletedTurn(t Turn) bool {
+	if strings.TrimSpace(t.Text) != "" || len(t.ToolUses) > 0 {
+		return false
+	}
+	switch strings.ToLower(t.StopReason) {
+	case "content_filter", "refusal":
+		return false
+	}
+	return true
+}
+
 type ToolUse struct {
 	ID     string         `json:"id"`
 	Name   string         `json:"name"`
@@ -775,6 +790,25 @@ func (c *Client) Complete(ctx context.Context, opts ChatOptions) (Result, error)
 	if len(result.Turn.Errors) > 0 {
 		c.logUpstreamFailure(result.Turn.Errors[0], resp.StatusCode, body, opts, endpoint, domain, region, model)
 		return Result{}, fmt.Errorf("%s", result.Turn.Errors[0])
+	}
+	// Upstream soft truncation: the generation is aborted mid-flight but
+	// the stream closes politely - a synthesized finish_reason=stop +
+	// [DONE] with zero text, zero tool calls and a zeroed usage frame.
+	// The proxy sees a successful completion; the agent receives an empty
+	// turn and the session silently stalls. The predicate follows the
+	// OpenAI Agents SDK empty-turn validation family (which itself still
+	// lets the stop-shaped empty turn through, the gap closed here);
+	// content_filter / refusal remain legitimate silences.
+	if isEmptyCompletedTurn(result.Turn) {
+		// Diagnostic counters go to the WARN log only, never into the error
+		// string: downstream retry/cooldown classification is Contains-based
+		// substring matching (11101/11140/429/502...), and a bare numeric
+		// run could forge a match.
+		c.logUpstreamFailure(fmt.Sprintf("empty completed turn (finish=%q thinking_len=%d usage_prompt=%d)",
+			result.Turn.StopReason, len(result.Turn.Thinking), result.Turn.Usage.PromptTokens),
+			resp.StatusCode, body, opts, endpoint, domain, region, model)
+		return Result{}, fmt.Errorf("CodeBuddy chat completion upstream aborted with empty completed turn (finish=%q) [region=%s site=%s endpoint=%s domain=%s model=%s]",
+			result.Turn.StopReason, region, config.NormalizeSite(opts.Site), endpoint, domain, model)
 	}
 	result.DurationMs = time.Since(started).Milliseconds()
 	result.Status = resp.StatusCode

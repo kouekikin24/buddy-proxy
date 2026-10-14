@@ -561,6 +561,14 @@ func (s *Service) shouldRetryNextAccount(err error, selection accounts.Selection
 	if strings.Contains(msg, "11140") || strings.Contains(msg, "request illegal") {
 		return false
 	}
+	// Empty completed turn (soft truncation): allow exactly ONE account
+	// switch replay. Reasoning-degeneration empties recur (public
+	// measurement ~29%), so chaining accounts only burns client patience;
+	// the second empty surfaces as a loud error. The failing account is
+	// not penalized - the lie is in the upstream termination frame.
+	if strings.Contains(msg, "empty completed turn") {
+		return opts.RetryDepth == 0
+	}
 	if billing.IsQuotaExhaustedError(err) {
 		return true
 	}
