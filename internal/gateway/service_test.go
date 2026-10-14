@@ -63,7 +63,18 @@ type scriptedChatTransport struct {
 	// headers (used to replay upstream "polite" terminations: finish frames,
 	// empty content, zeroed usage).
 	rawBodyByAuth map[string]string
+	// imageRejectLeftByAuth maps token -> how many chat calls must still be
+	// answered with an image-rejection 400 before this token behaves normally
+	// (image-rejection fixtures). imageRejectBody selects the wording: 11135
+	// "replace the image" (domestic) or 11133 "Invalid request parameters"
+	// (global, the production message that cycled 17 accounts).
+	imageRejectLeftByAuth map[string]int
+	imageRejectBody       string
 }
+
+// validPNG1x1B64 is a real decodable 1x1 red PNG (the egress autopsy
+// full-decodes images, so magic-only fixtures would now be stripped).
+const validPNG1x1B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
 // resetReader yields `data` then fails with `reset`: an upstream connection
 // torn down mid-response (transport RST after response headers).
@@ -132,7 +143,26 @@ func (t *scriptedChatTransport) RoundTrip(req *http.Request) (*http.Response, er
 	status := t.byAuth[token]
 	resetData, reset := t.resetBodyByAuth[token]
 	raw, rawOK := t.rawBodyByAuth[token]
+	var imageReject string
+	if n := t.imageRejectLeftByAuth[token]; n > 0 {
+		t.imageRejectLeftByAuth[token] = n - 1
+		imageReject = t.imageRejectBody
+		if imageReject == "" {
+			imageReject = `{"message":"Please start a new conversation, replace the image, and try again.","code":11135}`
+		}
+	}
 	t.mu.Unlock()
+	if imageReject != "" {
+		header := make(http.Header)
+		header.Set("Content-Type", "application/json")
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Status:     http.StatusText(http.StatusBadRequest),
+			Header:     header,
+			Body:       io.NopCloser(strings.NewReader(imageReject)),
+			Request:    req,
+		}, nil
+	}
 	if rawOK {
 		header := make(http.Header)
 		header.Set("Content-Type", "text/event-stream")
@@ -606,7 +636,7 @@ func TestCompleteFromPoolSendsNormalizedImagePartsUpstream(t *testing.T) {
 		Model: "auto", SessionKey: "conv-image-normalize",
 		Messages: []map[string]any{{"role": "user", "content": []any{
 			map[string]any{"type": "text", "text": "what color?"},
-			map[string]any{"type": "image", "dataUrl": "data:image/png;base64,iVBORw0KGgo=",
+			map[string]any{"type": "image", "dataUrl": "data:image/png;base64," + validPNG1x1B64,
 				"mediaType": "image/png",
 				"source":    map[string]any{"id": "read-image", "kind": "inline"}},
 		}}},
@@ -653,7 +683,7 @@ func TestCompleteFromPoolNormalizesPoisonedHistory(t *testing.T) {
 				map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "Read", "arguments": "{}"}},
 			}},
 			{"role": "tool", "toolCallId": "c1", "content": []any{
-				map[string]any{"type": "image", "mediaType": "image/png", "dataUrl": "data:image/png;base64,iVBORw0KGgo="},
+				map[string]any{"type": "image", "mediaType": "image/png", "dataUrl": "data:image/png;base64," + validPNG1x1B64},
 			}},
 			{"role": "user", "content": "what color?"},
 		},
@@ -738,6 +768,124 @@ func TestCompleteFromPoolStripsPoisonedImagesFromHistory(t *testing.T) {
 	}
 	if !strings.Contains(b, `"tool_calls"`) || !strings.Contains(b, `"tool_call_id"`) {
 		t.Fatalf("tool pairing must survive image stripping: %s", b[:min(400, len(b))])
+	}
+}
+
+func TestCompleteFromPoolReplaysStrippedAfterImageRejection(t *testing.T) {
+	// Image-rejection replay: upstream rejects the images in a request (11135 "replace the
+	// image") even though the egress autopsy passed them (unknown stricter
+	// check, e.g. moderation/size). The gateway must strip ALL images and
+	// replay once on the SAME account — session survives, account unpenalized.
+	dir := t.TempDir()
+	svc := New(config.Config{Site: "domestic", AccountsPath: dir + "/accounts.json"}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { _ = svc.Close() })
+	if _, _, err := svc.Pool.Upsert(accounts.CreateAccount(accounts.Account{
+		Label: "a", Site: "domestic", BearerToken: "token-a", Enabled: true,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	transport := &scriptedChatTransport{imageRejectLeftByAuth: map[string]int{"token-a": 1}}
+	svc.Provider.HTTP = &http.Client{Transport: transport}
+
+	_, err := svc.CompleteFromPool(context.Background(), CompleteOptions{
+		Model: "auto", SessionKey: "conv-image-reject",
+		Messages: []map[string]any{{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": "look"},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64," + validPNG1x1B64}},
+		}}},
+	})
+	if err != nil {
+		t.Fatalf("strip-replay should have rescued the turn: %v", err)
+	}
+	chat, _ := transport.snapshot()
+	if len(chat) != 2 {
+		t.Fatalf("chat calls=%v want 2 (reject + stripped replay)", chat)
+	}
+	if chat[0] != chat[1] {
+		t.Fatalf("strip replay must stay on the same account: %v", chat)
+	}
+	bodies := transport.snapshotBodies()
+	if !strings.Contains(bodies[0], "image_url") {
+		t.Fatal("first attempt should carry the image")
+	}
+	if strings.Contains(bodies[1], "image_url") || !strings.Contains(bodies[1], "[image removed: invalid image data]") {
+		t.Fatalf("replay body must be image-free with placeholder: %s", bodies[1][:min(400, len(bodies[1]))])
+	}
+}
+
+func TestCompleteFromPoolImageRejectionDoesNotRotateAccounts(t *testing.T) {
+	// No-rotation rule: 11133/11135 are request-level deterministic errors - with no
+	// images to strip, the request must fail loud after exactly ONE upstream
+	// call instead of cycling the pool (measured: one burn = 17 accounts
+	// in 22s for the identical 400).
+	dir := t.TempDir()
+	svc := New(config.Config{Site: "domestic", AccountsPath: dir + "/accounts.json"}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { _ = svc.Close() })
+	for _, tok := range []string{"token-a", "token-b", "token-c"} {
+		if _, _, err := svc.Pool.Upsert(accounts.CreateAccount(accounts.Account{
+			Label: tok, Site: "domestic", BearerToken: tok, Enabled: true,
+		})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	transport := &scriptedChatTransport{
+		imageRejectLeftByAuth: map[string]int{"token-a": 9, "token-b": 9, "token-c": 9},
+		// Production wording: the global-site 11133 message contains
+		// "invalid request" and DID hit the rotation whitelist (17 accounts,
+		// 22s) before the no-rotation rule - this fixture must keep that wording to
+		// stay discriminating.
+		imageRejectBody: `{"message":"Invalid request parameters","code":11133}`,
+	}
+	svc.Provider.HTTP = &http.Client{Transport: transport}
+
+	_, err := svc.CompleteFromPool(context.Background(), CompleteOptions{
+		Model: "auto", SessionKey: "conv-image-reject-rotate",
+		Messages: []map[string]any{{"role": "user", "content": "plain text, no images"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "11133") {
+		t.Fatalf("expected 11133 loud fail, got %v", err)
+	}
+	chat, _ := transport.snapshot()
+	if len(chat) != 1 {
+		t.Fatalf("image rejection must not rotate accounts: calls=%v", chat)
+	}
+}
+
+func TestCompleteFromPoolImageRejectionStripsOnceThenFailsLoud(t *testing.T) {
+	// Combined bound: images present but every attempt is
+	// rejected -> exactly 2 upstream calls (original + one strip replay, same
+	// account), then the original error surfaces. No second strip, no rotation.
+	dir := t.TempDir()
+	svc := New(config.Config{Site: "domestic", AccountsPath: dir + "/accounts.json"}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { _ = svc.Close() })
+	for _, tok := range []string{"token-a", "token-b"} {
+		if _, _, err := svc.Pool.Upsert(accounts.CreateAccount(accounts.Account{
+			Label: tok, Site: "domestic", BearerToken: tok, Enabled: true,
+		})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	transport := &scriptedChatTransport{
+		imageRejectLeftByAuth: map[string]int{"token-a": 9, "token-b": 9},
+		imageRejectBody:       `{"message":"Invalid request parameters","code":11133}`,
+	}
+	svc.Provider.HTTP = &http.Client{Transport: transport}
+
+	_, err := svc.CompleteFromPool(context.Background(), CompleteOptions{
+		Model: "auto", SessionKey: "conv-image-reject-twice",
+		Messages: []map[string]any{{"role": "user", "content": []any{
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64," + validPNG1x1B64}},
+		}}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "11133") {
+		t.Fatalf("expected 11133 loud fail, got %v", err)
+	}
+	chat, _ := transport.snapshot()
+	if len(chat) != 2 {
+		t.Fatalf("want exactly 2 calls (original + one strip replay), got %v", chat)
+	}
+	if chat[0] != chat[1] {
+		t.Fatalf("strip replay must not rotate: %v", chat)
 	}
 }
 

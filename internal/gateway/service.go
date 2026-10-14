@@ -50,6 +50,10 @@ var (
 	// can consume, so a replay is invisible and redialing another account
 	// heals the turn.
 	reRetryNextAccount = regexp.MustCompile(`(?i)\b429\b|\b502\b|\b503\b|\b504\b|rate.?limit|too many requests|site mismatch|invalid request|transport error|stream reset before first content`)
+	// reImageRejection matches upstream image rejections: workbuddy domestic
+	// 11135 "replace the image" and the international 11133 family. These are
+	// request-level deterministic errors.
+	reImageRejection = regexp.MustCompile(`(?i)code 11133|code 11135|replace the image`)
 )
 
 // maxResetReplays bounds the "reset before first content" replay chain to 2
@@ -277,8 +281,9 @@ type CompleteOptions struct {
 	OnThinkingDelta     func(string)
 	OnEvent             func(provider.Event)
 	RefreshRetry        bool
-	RetryDepth          int // internal recursion counter; callers must not set
-	ResetReplays        int // internal: reset-before-first-content replays consumed (see maxResetReplays)
+	RetryDepth          int  // internal recursion counter; callers must not set
+	ImageStripped       bool // internal: images were stripped and replayed once after an upstream image rejection
+	ResetReplays        int  // internal: reset-before-first-content replays consumed (see maxResetReplays)
 }
 
 // ImageOptions is one pooled image generation or edit.
@@ -431,6 +436,25 @@ func (s *Service) CompleteFromPool(ctx context.Context, opts CompleteOptions) (C
 			s.Log.Info("codebuddy request canceled by client", "accountId", account.ID, "model", opts.Model)
 			return CompleteResult{}, err
 		}
+		// Upstream image rejection (11133/11135/"replace the image") is a
+		// request-level deterministic error, yet the request does carry images
+		// that passed the egress autopsy (unknown stricter upstream checks -
+		// size/moderation). Strip ALL images (placeholder) and replay once on
+		// the SAME account: lose the images, keep the session. A failed replay
+		// falls back to the regular path (no account penalty - the account is
+		// not at fault for image rejections).
+		if !opts.ImageStripped && reImageRejection.MatchString(err.Error()) {
+			if stripped, changed := provider.StripImagesForReplay(opts.Messages); changed {
+				s.Log.Warn("replaying after stripping image parts", "accountId", account.ID, "error", err.Error())
+				replayOpts := opts
+				replayOpts.Messages = stripped
+				replayOpts.ImageStripped = true
+				replayOpts.AccountID = account.ID
+				if res, retryErr := s.CompleteFromPool(ctx, replayOpts); retryErr == nil {
+					return res, nil
+				}
+			}
+		}
 		if s.shouldRetryNextAccount(err, selection, opts) {
 			if pinKey != "" {
 				s.Pins.Forget(pinKey)
@@ -559,6 +583,13 @@ func (s *Service) shouldRetryNextAccount(err error, selection accounts.Selection
 	}
 	// 11140 为区域/策略非法请求，换号通常无效。
 	if strings.Contains(msg, "11140") || strings.Contains(msg, "request illegal") {
+		return false
+	}
+	// Image rejections (11133/11135) are request-level deterministic errors:
+	// switching accounts must give the same result (measured: one burn cycled
+	// 17 accounts in 22s for the identical 400). The strip-and-replay path
+	// already got its chance on the same account; a second failure is loud.
+	if reImageRejection.MatchString(err.Error()) {
 		return false
 	}
 	// Empty completed turn (soft truncation): allow exactly ONE account

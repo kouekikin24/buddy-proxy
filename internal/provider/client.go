@@ -8,6 +8,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"log/slog"
 	"net"
@@ -747,16 +750,18 @@ func firstKey(m map[string]any, keys ...string) (any, bool) {
 //     the image); parts with no extractable data stay verbatim (let the
 //     upstream raise a readable error - no fabrication);
 //  3. egress autopsy: every outbound image data URL (standard image_url
-//     parts and translation products alike) must pass imageDataURLIssue;
-//     undecodable / non-image payloads are stripped and replaced with a
-//     text placeholder (WARN recorded). A deterministic 400 poison sitting
-//     in history would otherwise be re-sent every turn and permanently
-//     kill the session - dropping one image is the lesser loss;
+//     parts and translation products alike) must pass imageDataURLIssue -
+//     base64 must decode, the magic header must match, and (since the
+//     full-decode check) PNG/JPEG/GIF bodies must actually decode at the
+//     declared size. Failures are stripped and replaced with a text
+//     placeholder (WARN recorded): a deterministic 400 poison sitting in
+//     history would otherwise be re-sent every turn and permanently kill
+//     the session - dropping one image is the lesser loss;
 //  4. collapses all-text part lists to a plain string (maximally
 //     compatible wire form);
 //  5. unknown types stay verbatim (no silent semantic guessing; they
 //     surface as loud, readable upstream errors).
-
+//
 // Returns any: string (all-text collapsed / stripped empty) or []any
 // (still structured).
 func normalizeContentParts(parts []any) any {
@@ -881,6 +886,33 @@ func imageDataURLIssue(url string) string {
 	if !hasImageMagic(data) {
 		return "magic bytes not an image"
 	}
+	return decodeImageBody(data)
+}
+
+// decodeImageBody fully decodes the image body: passing the magic check
+// only proves the label does not lie, and the production poison was a
+// counterexample - a PNG with a valid signature, valid chunk structure and
+// valid CRCs whose pixel data covered only 1/3 of the IHDR-declared size
+// (an agent-written crop script bug); strict upstream decoders reject it
+// deterministically (workbuddy 11135 "replace the image" / international
+// 11133 / z.ai 1210). Criteria align with the upstream: route by magic to
+// the Go stdlib full decode; anything that does not decode fully is bad.
+// Known limit: WEBP has no stdlib decoder and keeps the magic-only bound.
+func decodeImageBody(data []byte) string {
+	switch {
+	case len(data) >= 4 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G':
+		if _, err := png.Decode(bytes.NewReader(data)); err != nil {
+			return "undecodable image body"
+		}
+	case len(data) >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF:
+		if _, err := jpeg.Decode(bytes.NewReader(data)); err != nil {
+			return "undecodable image body"
+		}
+	case len(data) >= 4 && string(data[:4]) == "GIF8":
+		if _, err := gif.Decode(bytes.NewReader(data)); err != nil {
+			return "undecodable image body"
+		}
+	}
 	return ""
 }
 
@@ -947,6 +979,54 @@ func declaredDataURLMIME(url string) string {
 func warnDroppedImage(url, issue string) {
 	slog.Default().Warn("dropped invalid image part",
 		"reason", issue, "declared_mime", declaredDataURLMIME(url), "url_len", len(url))
+}
+
+// StripImagesForReplay replaces every image part (standard image_url and
+// internal image shapes) with placeholder text: when the upstream still
+// rejects the images (11133/11135) and the egress autopsy did not catch
+// them (unknown stricter upstream checks - size/moderation), stripping and
+// replaying once is the last line of defense ("lose the images, keep the
+// session"). Returns a copy and a new message list; changed=false means
+// nothing to strip (the caller does not need to replay). Non-image parts,
+// tool_calls and tool_call_id pass through unchanged.
+func StripImagesForReplay(messages []map[string]any) ([]map[string]any, bool) {
+	out := make([]map[string]any, 0, len(messages))
+	changed := false
+	for _, m := range messages {
+		parts, ok := m["content"].([]any)
+		if !ok {
+			out = append(out, m)
+			continue
+		}
+		kept := make([]any, 0, len(parts))
+		placeholderAdded := false
+		msgChanged := false
+		for _, p := range parts {
+			if pm, isMap := p.(map[string]any); isMap {
+				if typ, _ := pm["type"].(string); typ == "image" || typ == "image_url" {
+					msgChanged = true
+					if !placeholderAdded {
+						kept = append(kept, map[string]any{"type": "text", "text": droppedImagePlaceholder})
+						placeholderAdded = true
+					}
+					continue
+				}
+			}
+			kept = append(kept, p)
+		}
+		if !msgChanged {
+			out = append(out, m)
+			continue
+		}
+		changed = true
+		nm := make(map[string]any, len(m))
+		for k, v := range m {
+			nm[k] = v
+		}
+		nm["content"] = kept
+		out = append(out, nm)
+	}
+	return out, changed
 }
 
 func (c *Client) Complete(ctx context.Context, opts ChatOptions) (Result, error) {

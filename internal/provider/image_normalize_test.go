@@ -1,18 +1,31 @@
 package provider
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/png"
 	"reflect"
 	"strings"
 	"testing"
 )
 
-// pngDataURL produces a data URL with a real PNG magic header (the egress
-// autopsy only passes legitimate images).
+// validJPEG1x1 is a real decodable 1x1 JPEG (the egress autopsy
+// full-decodes since; magic-only fixtures now fail their own check).
+const validJPEG1x1 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AVN//2Q=="
+
+// pngDataURL produces a real decodable 1x1 red PNG data URL; body
+// appends trailing bytes (png.Decode tolerates data after IEND,
+// used to build same-shape valid images with different URLs).
 func pngDataURL(body ...byte) string {
-	full := append([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, body...)
-	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(full)
+	var buf bytes.Buffer
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.RGBA{255, 0, 0, 255})
+	_ = png.Encode(&buf, img)
+	raw := append(buf.Bytes(), body...)
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw)
 }
 
 func TestNormalizeContentParts(t *testing.T) {
@@ -23,7 +36,7 @@ func TestNormalizeContentParts(t *testing.T) {
 	}
 	anthropicImage := map[string]any{
 		"type":   "image",
-		"source": map[string]any{"type": "base64", "media_type": "image/jpeg", "data": "/9j/"},
+		"source": map[string]any{"type": "base64", "media_type": "image/jpeg", "data": validJPEG1x1},
 	}
 	alreadyImage := map[string]any{
 		"type":      "image_url",
@@ -46,7 +59,7 @@ func TestNormalizeContentParts(t *testing.T) {
 			map[string]any{"type": "image_url", "image_url": map[string]any{"url": pngDataURL()}},
 		}},
 		{"anthropic source assembled", []any{anthropicImage}, []any{
-			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/jpeg;base64,/9j/"}},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/jpeg;base64," + validJPEG1x1}},
 		}},
 		{"standard image untouched + reasoning dropped", []any{reasoning, alreadyImage}, []any{alreadyImage}},
 		{"no-data image kept verbatim (no fabrication)", []any{noDataImage}, []any{noDataImage}},
