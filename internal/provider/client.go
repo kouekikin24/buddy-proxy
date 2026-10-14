@@ -958,6 +958,12 @@ func (c *Client) readSSE(body io.Reader, opts ChatOptions) (Result, error) {
 	var (
 		eventCount int
 		deltaCount int
+		// sawContent: true once any text or tool-call delta has been forwarded
+		// to the client. Reasoning (thinking) deltas do not count - agent
+		// clients consume text + tool calls and treat reasoning as auxiliary
+		// display, so replaying after a thinking-only cut cannot duplicate
+		// anything the user saw.
+		sawContent bool
 		bytesRead  int64
 		dataBuf    strings.Builder
 	)
@@ -981,6 +987,14 @@ func (c *Client) readSSE(body io.Reader, opts ChatOptions) (Result, error) {
 			events = MapSSEEvent(payload)
 		}
 		for _, event := range events {
+			switch event.Type {
+			case "text_delta":
+				if event.Text != "" {
+					sawContent = true
+				}
+			case "tool_call_delta", "tool_use":
+				sawContent = true
+			}
 			if event.Type == "text_delta" && event.Text != "" {
 				event.Text = fixer.Feed(event.Text)
 			}
@@ -1019,6 +1033,18 @@ func (c *Client) readSSE(body io.Reader, opts ChatOptions) (Result, error) {
 			break
 		}
 		if err != nil {
+			// The upstream stream was torn down by the transport (idle
+			// reclamation / connection reset) before any text or tool-call
+			// delta was forwarded. At this point the client has received at
+			// most the role frame, keep-alive comments and reasoning deltas
+			// (reasoning replay is harmless for agent clients), so a replay
+			// is invisible and the failover layer may redial on another
+			// account (see reRetryNextAccount). Once text/tools were
+			// delivered, a replay would duplicate visible content and stays
+			// out of scope.
+			if !sawContent {
+				return Result{}, fmt.Errorf("CodeBuddy chat completion stream reset before first content: %w", err)
+			}
 			return Result{}, err
 		}
 	}

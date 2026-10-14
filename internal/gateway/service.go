@@ -41,10 +41,25 @@ const (
 var (
 	errRetryDepthExceeded = errors.New("CodeBuddy 请求重试深度超限")
 	// 包级预编译，避免热路径（每个 chat 请求）重复编译正则。
-	reProviderModel    = regexp.MustCompile(`(?i)^codebuddy(?:(?:/|:)(.*))?$`)
-	reAuthFailure      = regexp.MustCompile(`(?i)(?:\b401\b|\b403\b|unauthori[sz]ed|forbidden|token|credential|auth|login|not authenticated|未登录|登录|凭证)`)
-	reRetryNextAccount = regexp.MustCompile(`(?i)\b429\b|\b502\b|\b503\b|\b504\b|rate.?limit|too many requests|site mismatch|invalid request`)
+	reProviderModel = regexp.MustCompile(`(?i)^codebuddy(?:(?:/|:)(.*))?$`)
+	reAuthFailure   = regexp.MustCompile(`(?i)(?:\b401\b|\b403\b|unauthori[sz]ed|forbidden|token|credential|auth|login|not authenticated|未登录|登录|凭证)`)
+	// "transport error" = Do-phase connection failure (before response headers);
+	// "stream reset before first content" = upstream tore the stream down after
+	// the 200 headers but before any text/tool delta was forwarded
+	// (provider.readSSE marks it). Neither has delivered anything the client
+	// can consume, so a replay is invisible and redialing another account
+	// heals the turn.
+	reRetryNextAccount = regexp.MustCompile(`(?i)\b429\b|\b502\b|\b503\b|\b504\b|rate.?limit|too many requests|site mismatch|invalid request|transport error|stream reset before first content`)
 )
+
+// maxResetReplays bounds the "reset before first content" replay chain to 2
+// replays (3 upstream calls). Each such replay restarts the thinking phase
+// from scratch - measured 15-20 minutes of wall clock per attempt - and
+// re-bills the full prompt against a cold account cache (one measured chain
+// collapsed the cache hit rate from 99% to 6.5%). Cycling every account
+// could stitch hours from a single request; past the budget the last error
+// is surfaced to the client instead.
+const maxResetReplays = 2
 
 type Stats struct {
 	TotalRequests         int64  `json:"totalRequests"`
@@ -262,7 +277,8 @@ type CompleteOptions struct {
 	OnThinkingDelta     func(string)
 	OnEvent             func(provider.Event)
 	RefreshRetry        bool
-	RetryDepth          int // 内部递归计数，调用方勿手动设置
+	RetryDepth          int // internal recursion counter; callers must not set
+	ResetReplays        int // internal: reset-before-first-content replays consumed (see maxResetReplays)
 }
 
 // ImageOptions is one pooled image generation or edit.
@@ -427,6 +443,9 @@ func (s *Service) CompleteFromPool(ctx context.Context, opts CompleteOptions) (C
 			opts.ExcludeIDs = next
 			opts.AccountID = ""
 			opts.RetryDepth++
+			if strings.Contains(strings.ToLower(err.Error()), "stream reset before first content") {
+				opts.ResetReplays++
+			}
 			retried, retryErr := s.CompleteFromPool(ctx, opts)
 			if retryErr != nil {
 				// 不要用「无可用账号 / 重试深度超限」掩盖真实上游错误（429/503 等）。
@@ -544,6 +563,12 @@ func (s *Service) shouldRetryNextAccount(err error, selection accounts.Selection
 	}
 	if billing.IsQuotaExhaustedError(err) {
 		return true
+	}
+	// Bound the reset-replay chain: each replay can burn 15-20 minutes of
+	// wall clock (thinking restarts), so past the budget stop switching
+	// and surface the last error to the client.
+	if opts.ResetReplays >= maxResetReplays && strings.Contains(msg, "stream reset before first content") {
+		return false
 	}
 	return reRetryNextAccount.MatchString(err.Error())
 }
