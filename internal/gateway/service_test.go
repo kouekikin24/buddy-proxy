@@ -625,6 +625,60 @@ func TestCompleteFromPoolSendsNormalizedImagePartsUpstream(t *testing.T) {
 	}
 }
 
+func TestCompleteFromPoolNormalizesPoisonedHistory(t *testing.T) {
+	// Reproduces the production shape: assistant reasoning parts,
+	// camelCase tool keys, image inside a tool result. Upstream rejects each
+	// deviation (probe-proven 11101/11133); the gateway must normalize all
+	// three before send so the session self-heals.
+	dir := t.TempDir()
+	svc := New(config.Config{Site: "domestic", AccountsPath: dir + "/accounts.json"}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { _ = svc.Close() })
+	if _, _, err := svc.Pool.Upsert(accounts.CreateAccount(accounts.Account{
+		Label: "a", Site: "domestic", BearerToken: "token-a", Enabled: true,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	transport := &scriptedChatTransport{}
+	svc.Provider.HTTP = &http.Client{Transport: transport}
+
+	_, err := svc.CompleteFromPool(context.Background(), CompleteOptions{
+		Model: "auto", SessionKey: "conv-poisoned-history",
+		Messages: []map[string]any{
+			{"role": "user", "content": "read the image"},
+			{"role": "assistant", "content": []any{
+				map[string]any{"type": "reasoning", "text": "I should call Read"},
+				map[string]any{"type": "text", "text": ""},
+			}, "toolCalls": []any{
+				map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "Read", "arguments": "{}"}},
+			}},
+			{"role": "tool", "toolCallId": "c1", "content": []any{
+				map[string]any{"type": "image", "mediaType": "image/png", "dataUrl": "data:image/png;base64,QUJD"},
+			}},
+			{"role": "user", "content": "what color?"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodies := transport.snapshotBodies()
+	if len(bodies) != 1 {
+		t.Fatalf("bodies=%d want 1", len(bodies))
+	}
+	b := bodies[0]
+	if strings.Contains(b, `"reasoning"`) {
+		t.Fatalf("reasoning leaked upstream: %s", b[:min(400, len(b))])
+	}
+	if strings.Contains(b, `"type":"image"`) {
+		t.Fatalf("raw image part leaked upstream: %s", b[:min(400, len(b))])
+	}
+	if !strings.Contains(b, `"image_url"`) {
+		t.Fatalf("image not normalized to image_url: %s", b[:min(400, len(b))])
+	}
+	if !strings.Contains(b, `"tool_calls"`) || !strings.Contains(b, `"tool_call_id"`) {
+		t.Fatalf("camel keys not adopted into snake wire format: %s", b[:min(400, len(b))])
+	}
+}
+
 func TestCompleteFromPoolPinnedAccountHealsAfterSiteMismatch(t *testing.T) {
 	dir := t.TempDir()
 	svc := New(config.Config{Site: "domestic", AccountsPath: dir + "/accounts.json"}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))

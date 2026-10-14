@@ -3,108 +3,139 @@ package provider
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
-func TestNormalizeImageContentParts(t *testing.T) {
-	zcodePart := map[string]any{
-		"type":      "image",
-		"mediaType": "image/png",
-		"dataUrl":   "data:image/png;base64,QUJD",
-		"source":    map[string]any{"id": "read-image", "kind": "inline", "mimeType": "image/png", "sizeBytes": 3},
+func TestNormalizeContentParts(t *testing.T) {
+	zcodeImage := map[string]any{
+		"type": "image", "mediaType": "image/png",
+		"dataUrl": "data:image/png;base64,QUJD",
+		"source":  map[string]any{"id": "read-image", "kind": "inline"},
 	}
-	anthropicPart := map[string]any{
+	anthropicImage := map[string]any{
 		"type":   "image",
 		"source": map[string]any{"type": "base64", "media_type": "image/jpeg", "data": "WFla"},
 	}
-	alreadyPart := map[string]any{
+	alreadyImage := map[string]any{
 		"type":      "image_url",
 		"image_url": map[string]any{"url": "https://example.com/x.png"},
 	}
-	noDataURL := map[string]any{"type": "image", "source": map[string]any{"kind": "url"}}
-	textPart := map[string]any{"type": "text", "text": "hello"}
+	noDataImage := map[string]any{"type": "image", "source": map[string]any{"kind": "url"}}
+	reasoning := map[string]any{"type": "reasoning", "text": "deep thoughts"}
+	text := map[string]any{"type": "text", "text": "hello"}
+	unknown := map[string]any{"type": "audio", "data": "x"}
 
-	in := []any{textPart, zcodePart, anthropicPart, alreadyPart, noDataURL}
-	out := normalizeImageContentParts(in)
-
-	if len(out) != len(in) {
-		t.Fatalf("part count changed: %d -> %d", len(in), len(out))
+	cases := []struct {
+		name string
+		in   []any
+		want any // string => expect full equality; []any => element-wise
+	}{
+		{"reasoning+text collapses to string", []any{reasoning, text}, "hello"},
+		{"reasoning-only becomes empty string", []any{reasoning}, ""},
+		{"image translated, text kept, stays structured", []any{text, zcodeImage}, []any{
+			text,
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,QUJD"}},
+		}},
+		{"anthropic source assembled", []any{anthropicImage}, []any{
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/jpeg;base64,WFla"}},
+		}},
+		{"standard image untouched + reasoning dropped", []any{reasoning, alreadyImage}, []any{alreadyImage}},
+		{"no-data image kept verbatim (no fabrication)", []any{noDataImage}, []any{noDataImage}},
+		{"unknown type preserved for loud upstream error", []any{text, unknown}, []any{text, unknown}},
 	}
-	// text untouched
-	if !reflect.DeepEqual(out[0], textPart) {
-		t.Fatalf("text part altered: %v", out[0])
-	}
-	// zcode shape -> image_url with its dataUrl
-	assertImageURL(t, out[1], "data:image/png;base64,QUJD")
-	// anthropic source -> assembled data URL
-	assertImageURL(t, out[2], "data:image/jpeg;base64,WFla")
-	// already standard -> untouched
-	if !reflect.DeepEqual(out[3], alreadyPart) {
-		t.Fatalf("standard image_url part altered: %v", out[3])
-	}
-	// no extractable data -> kept verbatim (upstream error, no fabrication)
-	if !reflect.DeepEqual(out[4], noDataURL) {
-		t.Fatalf("undata-able part must stay verbatim: %v", out[4])
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeContentParts(tc.in)
+			switch want := tc.want.(type) {
+			case string:
+				s, ok := got.(string)
+				if !ok || s != want {
+					t.Fatalf("got %#v want string %q", got, want)
+				}
+			case []any:
+				g, ok := got.([]any)
+				if !ok || !reflect.DeepEqual(g, want) {
+					t.Fatalf("got %#v want %#v", got, want)
+				}
+			}
+		})
 	}
 	// input must not be mutated
-	if in[1].(map[string]any)["type"] != "image" {
-		t.Fatal("input part mutated")
+	in := []any{reasoning, zcodeImage}
+	normalizeContentParts(in)
+	if in[0].(map[string]any)["type"] != "reasoning" || in[1].(map[string]any)["type"] != "image" {
+		t.Fatal("input parts mutated")
 	}
 }
 
-func assertImageURL(t *testing.T, got any, wantURL string) {
-	t.Helper()
-	m, ok := got.(map[string]any)
-	if !ok {
-		t.Fatalf("part not a map: %v", got)
-	}
-	if m["type"] != "image_url" {
-		t.Fatalf("type = %v, want image_url", m["type"])
-	}
-	iu, ok := m["image_url"].(map[string]any)
-	if !ok {
-		t.Fatalf("image_url block missing: %v", m)
-	}
-	if iu["url"] != wantURL {
-		t.Fatalf("url = %v, want %v", iu["url"], wantURL)
-	}
-}
-
-func TestEnsureUpstreamMessagesTranslatesImageParts(t *testing.T) {
+func TestEnsureUpstreamMessagesStripsReasoningAndTranslatesImages(t *testing.T) {
 	msgs := []map[string]any{
 		{"role": "system", "content": "be helpful"},
 		{"role": "user", "content": []any{
 			map[string]any{"type": "text", "text": "what color?"},
 			map[string]any{"type": "image", "dataUrl": "data:image/png;base64,QUJD", "mediaType": "image/png"},
 		}},
+		{"role": "assistant", "content": []any{
+			map[string]any{"type": "reasoning", "text": "pondering"},
+			map[string]any{"type": "text", "text": "pink"},
+		}},
 		{"role": "tool", "tool_call_id": "call_1", "content": []any{
 			map[string]any{"type": "image", "dataUrl": "data:image/png;base64,REFU"},
 		}},
 	}
 	out := EnsureUpstreamMessages(msgs)
-	// foldClientInstructions inserts a separate string-content user message
-	// for the folded instructions; the original list-content messages must
-	// survive verbatim somewhere in the output. Scan all messages.
-	var userContent, toolContent any
+	raw, _ := json.Marshal(out)
+	s := string(raw)
+	if strings.Contains(s, `"reasoning"`) {
+		t.Fatalf("reasoning survived normalization: %s", s)
+	}
+	// assistant pure reasoning+text collapsed to string "pink"
 	for _, m := range out {
-		if c, ok := m["content"].([]any); ok {
-			for _, p := range c {
-				if pm, ok := p.(map[string]any); ok && pm["type"] == "image_url" {
-					switch m["role"] {
-					case "user":
-						userContent = m["content"]
-					case "tool":
-						toolContent = m["content"]
-					}
-				}
-			}
+		if m["role"] == "assistant" && m["content"] != "pink" {
+			t.Fatalf("assistant should collapse to string, got %#v", m["content"])
 		}
 	}
-	if userContent == nil {
-		t.Fatal("no user message with image_url parts survived folding")
+	assertHasImageURL(t, findContent(out, "user"), "data:image/png;base64,QUJD")
+	assertHasImageURL(t, findContent(out, "tool"), "data:image/png;base64,REFU")
+}
+
+func TestEnsureUpstreamMessagesAdoptsCamelCaseKeys(t *testing.T) {
+	msgs := []map[string]any{
+		{"role": "user", "content": "run it"},
+		{"role": "assistant", "content": "", "toolCalls": []any{
+			map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "Bash", "arguments": "{}"}},
+		}},
+		{"role": "tool", "toolCallId": "c1", "toolName": "Bash", "content": "done"},
 	}
-	assertHasImageURL(t, userContent, "data:image/png;base64,QUJD")
-	assertHasImageURL(t, toolContent, "data:image/png;base64,REFU")
+	out := EnsureUpstreamMessages(msgs)
+	var assistant, tool map[string]any
+	for _, m := range out {
+		switch m["role"] {
+		case "assistant":
+			assistant = m
+		case "tool":
+			tool = m
+		}
+	}
+	if assistant == nil || len(asAnySlice(assistant["tool_calls"])) != 1 {
+		t.Fatalf("camel toolCalls not adopted: %#v", assistant)
+	}
+	if tool == nil || tool["tool_call_id"] != "c1" || tool["name"] != "Bash" {
+		t.Fatalf("camel toolCallId/toolName not adopted: %#v", tool)
+	}
+}
+
+func findContent(out []map[string]any, role string) any {
+	for _, m := range out {
+		if m["role"] == role {
+			if _, isStr := m["content"].(string); isStr {
+				continue
+			}
+			return m["content"]
+		}
+	}
+	return nil
 }
 
 func assertHasImageURL(t *testing.T, content any, wantURL string) {

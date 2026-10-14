@@ -591,15 +591,21 @@ func EnsureUpstreamMessages(messages []map[string]any) []map[string]any {
 	for _, message := range messages {
 		role := NormalizeMessageRole(fmt.Sprint(message["role"]))
 		item := map[string]any{"role": role}
-		if toolCalls, ok := message["tool_calls"]; ok {
+		// camelCase adoption: some clients (AI-SDK style) leak their internal
+		// camelCase aliases onto the wire; reading only snake_case silently
+		// drops the tool structure -> orphaned tool messages -> permanent 400s
+		// for the session. snake_case wins, camelCase is the fallback;
+		// standard requests are unaffected (same dual-key tolerance a sibling
+		// gateway ships).
+		if toolCalls, ok := firstKey(message, "tool_calls", "toolCalls"); ok {
 			if normalized := asAnySlice(toolCalls); len(normalized) > 0 {
 				item["tool_calls"] = normalized
 			}
 		}
-		if id, ok := message["tool_call_id"]; ok {
+		if id, ok := firstKey(message, "tool_call_id", "toolCallId"); ok {
 			item["tool_call_id"] = id
 		}
-		if name, ok := message["name"]; ok {
+		if name, ok := firstKey(message, "name", "toolName"); ok {
 			item["name"] = name
 		}
 		item["content"] = flattenContent(message["content"])
@@ -710,7 +716,7 @@ func flattenContent(content any) any {
 			}
 		}
 		if structured {
-			return normalizeImageContentParts(v)
+			return normalizeContentParts(v)
 		}
 		return strings.Join(parts, "")
 	default:
@@ -718,35 +724,78 @@ func flattenContent(content any) any {
 	}
 }
 
-// normalizeImageContentParts translates non-standard image content blocks
-// into the OpenAI image_url shape the upstream accepts (probe-proven: some
-// agent clients put their internal shape
-// {"type":"image","dataUrl":...,"mediaType":...,"source":{...}} on the
-// wire; workbuddy rejects it with 11101/11133 and z.ai with 1210, while
-// the standard image_url shape with a real screenshot returns 200 and the
-// model describes the image correctly). Parts already in image_url form
-// and parts with no extractable image data stay verbatim (no fabrication).
-func normalizeImageContentParts(parts []any) []any {
+// firstKey returns the first present key value by priority order.
+func firstKey(m map[string]any, keys ...string) (any, bool) {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+// normalizeContentParts normalizes outbound content shapes (same family as
+// a sibling gateway's PrepareBodyOpt sanitizer):
+//  1. strips {"type":"reasoning"} echo blocks - the upstream rejects them
+//     (probe-pinned 11101); reasoning is auxiliary data with no consumer
+//     on history replay;
+//  2. translates non-standard image blocks to OpenAI image_url (probe-
+//     proven: some clients send their internal shape
+//     {"type":"image","dataUrl":...}; workbuddy 11101/11133, z.ai 1210 -
+//     while the standard image_url shape returns 200 and the model sees
+//     the image); parts with no extractable data stay verbatim (let the
+//     upstream raise a readable error - no fabrication);
+//  3. collapses all-text part lists to a plain string (maximally
+//     compatible wire form);
+//  4. unknown types stay verbatim (no silent semantic guessing; they
+//     surface as loud, readable upstream errors).
+//
+// Returns any: string (all-text collapsed / stripped empty) or []any
+// (still structured).
+func normalizeContentParts(parts []any) any {
+
 	out := make([]any, 0, len(parts))
+	allText := true
 	for _, part := range parts {
 		m, ok := part.(map[string]any)
 		if !ok {
+			allText = false
 			out = append(out, part)
 			continue
 		}
-		if typ, _ := m["type"].(string); typ != "image" {
-			out = append(out, part)
+		switch m["type"] {
+		case "reasoning":
 			continue
-		}
-		url, found := extractImageDataURL(m)
-		if !found {
+		case "image":
+			allText = false
+			if url, found := extractImageDataURL(m); found {
+				out = append(out, map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]any{"url": url},
+				})
+				continue
+			}
 			out = append(out, part)
-			continue
+		default:
+			if typ, _ := m["type"].(string); typ != "text" {
+				allText = false
+			}
+			out = append(out, part)
 		}
-		out = append(out, map[string]any{
-			"type":      "image_url",
-			"image_url": map[string]any{"url": url},
-		})
+	}
+	if allText {
+		var sb strings.Builder
+		for _, p := range out {
+			if m, ok := p.(map[string]any); ok {
+				if t, ok := m["text"].(string); ok {
+					sb.WriteString(t)
+				}
+			}
+		}
+		return sb.String()
+	}
+	if len(out) == 0 {
+		return ""
 	}
 	return out
 }
