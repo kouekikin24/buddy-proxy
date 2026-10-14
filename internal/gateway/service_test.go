@@ -589,6 +589,42 @@ func TestEmptyCompletedTurnReplayIsBoundedToOne(t *testing.T) {
 	}
 }
 
+func TestCompleteFromPoolSendsNormalizedImagePartsUpstream(t *testing.T) {
+	dir := t.TempDir()
+	svc := New(config.Config{Site: "domestic", AccountsPath: dir + "/accounts.json"}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { _ = svc.Close() })
+	if _, _, err := svc.Pool.Upsert(accounts.CreateAccount(accounts.Account{
+		Label: "a", Site: "domestic", BearerToken: "token-a", Enabled: true,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	transport := &scriptedChatTransport{}
+	svc.Provider.HTTP = &http.Client{Transport: transport}
+
+	_, err := svc.CompleteFromPool(context.Background(), CompleteOptions{
+		Model: "auto", SessionKey: "conv-image-normalize",
+		Messages: []map[string]any{{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": "what color?"},
+			map[string]any{"type": "image", "dataUrl": "data:image/png;base64,QUJD",
+				"mediaType": "image/png",
+				"source":    map[string]any{"id": "read-image", "kind": "inline"}},
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodies := transport.snapshotBodies()
+	if len(bodies) != 1 {
+		t.Fatalf("chat bodies=%d want 1", len(bodies))
+	}
+	if !strings.Contains(bodies[0], `"image_url"`) {
+		t.Fatalf("upstream body must carry normalized image_url parts, got %s", bodies[0][:min(300, len(bodies[0]))])
+	}
+	if strings.Contains(bodies[0], `"type":"image"`) {
+		t.Fatalf("non-standard image part leaked upstream: %s", bodies[0][:min(300, len(bodies[0]))])
+	}
+}
+
 func TestCompleteFromPoolPinnedAccountHealsAfterSiteMismatch(t *testing.T) {
 	dir := t.TempDir()
 	svc := New(config.Config{Site: "domestic", AccountsPath: dir + "/accounts.json"}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))

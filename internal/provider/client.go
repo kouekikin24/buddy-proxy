@@ -710,12 +710,65 @@ func flattenContent(content any) any {
 			}
 		}
 		if structured {
-			return v
+			return normalizeImageContentParts(v)
 		}
 		return strings.Join(parts, "")
 	default:
 		return fmt.Sprint(v)
 	}
+}
+
+// normalizeImageContentParts translates non-standard image content blocks
+// into the OpenAI image_url shape the upstream accepts (probe-proven: some
+// agent clients put their internal shape
+// {"type":"image","dataUrl":...,"mediaType":...,"source":{...}} on the
+// wire; workbuddy rejects it with 11101/11133 and z.ai with 1210, while
+// the standard image_url shape with a real screenshot returns 200 and the
+// model describes the image correctly). Parts already in image_url form
+// and parts with no extractable image data stay verbatim (no fabrication).
+func normalizeImageContentParts(parts []any) []any {
+	out := make([]any, 0, len(parts))
+	for _, part := range parts {
+		m, ok := part.(map[string]any)
+		if !ok {
+			out = append(out, part)
+			continue
+		}
+		if typ, _ := m["type"].(string); typ != "image" {
+			out = append(out, part)
+			continue
+		}
+		url, found := extractImageDataURL(m)
+		if !found {
+			out = append(out, part)
+			continue
+		}
+		out = append(out, map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": url},
+		})
+	}
+	return out
+}
+
+// extractImageDataURL accepts two carriers: a top-level dataUrl (the
+// agent-internal shape), or an Anthropic-style
+// source{type:"base64", media_type|mediaType, data}.
+func extractImageDataURL(part map[string]any) (string, bool) {
+	if du, ok := part["dataUrl"].(string); ok && strings.HasPrefix(du, "data:") {
+		return du, true
+	}
+	if src, ok := part["source"].(map[string]any); ok {
+		data, _ := src["data"].(string)
+		mime, ok1 := src["media_type"].(string)
+		if !ok1 {
+			mime, _ = src["mediaType"].(string)
+		}
+		if data != "" && mime != "" {
+			return "data:" + mime + ";base64," + data, true
+		}
+	}
+	return "", false
 }
 
 func (c *Client) Complete(ctx context.Context, opts ChatOptions) (Result, error) {
