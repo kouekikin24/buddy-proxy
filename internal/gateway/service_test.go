@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -605,7 +606,7 @@ func TestCompleteFromPoolSendsNormalizedImagePartsUpstream(t *testing.T) {
 		Model: "auto", SessionKey: "conv-image-normalize",
 		Messages: []map[string]any{{"role": "user", "content": []any{
 			map[string]any{"type": "text", "text": "what color?"},
-			map[string]any{"type": "image", "dataUrl": "data:image/png;base64,QUJD",
+			map[string]any{"type": "image", "dataUrl": "data:image/png;base64,iVBORw0KGgo=",
 				"mediaType": "image/png",
 				"source":    map[string]any{"id": "read-image", "kind": "inline"}},
 		}}},
@@ -652,7 +653,7 @@ func TestCompleteFromPoolNormalizesPoisonedHistory(t *testing.T) {
 				map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "Read", "arguments": "{}"}},
 			}},
 			{"role": "tool", "toolCallId": "c1", "content": []any{
-				map[string]any{"type": "image", "mediaType": "image/png", "dataUrl": "data:image/png;base64,QUJD"},
+				map[string]any{"type": "image", "mediaType": "image/png", "dataUrl": "data:image/png;base64,iVBORw0KGgo="},
 			}},
 			{"role": "user", "content": "what color?"},
 		},
@@ -676,6 +677,67 @@ func TestCompleteFromPoolNormalizesPoisonedHistory(t *testing.T) {
 	}
 	if !strings.Contains(b, `"tool_calls"`) || !strings.Contains(b, `"tool_call_id"`) {
 		t.Fatalf("camel keys not adopted into snake wire format: %s", b[:min(400, len(b))])
+	}
+}
+
+func TestCompleteFromPoolStripsPoisonedImagesFromHistory(t *testing.T) {
+	// The exact captured wire shape: standard image_url parts whose base64
+	// the provider cannot decode (probe A) or whose bytes are not an image
+	// (probe B, raw dumps). Upstream answers deterministic 400/11133 every
+	// turn while the poison sits in history (one production session). The gateway
+	// must strip bad images at egress and keep the conversation alive.
+	dir := t.TempDir()
+	svc := New(config.Config{Site: "domestic", AccountsPath: dir + "/accounts.json"}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { _ = svc.Close() })
+	if _, _, err := svc.Pool.Upsert(accounts.CreateAccount(accounts.Account{
+		Label: "a", Site: "domestic", BearerToken: "token-a", Enabled: true,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	transport := &scriptedChatTransport{}
+	svc.Provider.HTTP = &http.Client{Transport: transport}
+
+	poison := "####not base64####"
+	rawRGBA := base64.StdEncoding.EncodeToString([]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08})
+	_, err := svc.CompleteFromPool(context.Background(), CompleteOptions{
+		Model: "auto", SessionKey: "conv-poisoned-images",
+		Messages: []map[string]any{
+			{"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "check this"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{
+					"url": "data:image/png;base64," + poison,
+				}},
+			}},
+			{"role": "assistant", "content": "looking", "tool_calls": []any{
+				map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "Read", "arguments": "{}"}},
+			}},
+			{"role": "tool", "tool_call_id": "c1", "content": []any{
+				map[string]any{"type": "image_url", "image_url": map[string]any{
+					"url": "data:image/png;base64," + rawRGBA,
+				}},
+			}},
+			{"role": "user", "content": "and now?"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodies := transport.snapshotBodies()
+	if len(bodies) != 1 {
+		t.Fatalf("bodies=%d want 1", len(bodies))
+	}
+	b := bodies[0]
+	if strings.Contains(b, poison) || strings.Contains(b, rawRGBA) {
+		t.Fatalf("bad image payload leaked upstream: %s", b[:min(400, len(b))])
+	}
+	if strings.Contains(b, `"image_url"`) {
+		t.Fatalf("stripped image part survived upstream: %s", b[:min(400, len(b))])
+	}
+	if !strings.Contains(b, "[image removed: invalid image data]") {
+		t.Fatalf("placeholder missing upstream: %s", b[:min(400, len(b))])
+	}
+	if !strings.Contains(b, `"tool_calls"`) || !strings.Contains(b, `"tool_call_id"`) {
+		t.Fatalf("tool pairing must survive image stripping: %s", b[:min(400, len(b))])
 	}
 }
 

@@ -1,21 +1,29 @@
 package provider
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
 )
 
+// pngDataURL produces a data URL with a real PNG magic header (the egress
+// autopsy only passes legitimate images).
+func pngDataURL(body ...byte) string {
+	full := append([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, body...)
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(full)
+}
+
 func TestNormalizeContentParts(t *testing.T) {
 	zcodeImage := map[string]any{
 		"type": "image", "mediaType": "image/png",
-		"dataUrl": "data:image/png;base64,QUJD",
+		"dataUrl": pngDataURL(),
 		"source":  map[string]any{"id": "read-image", "kind": "inline"},
 	}
 	anthropicImage := map[string]any{
 		"type":   "image",
-		"source": map[string]any{"type": "base64", "media_type": "image/jpeg", "data": "WFla"},
+		"source": map[string]any{"type": "base64", "media_type": "image/jpeg", "data": "/9j/"},
 	}
 	alreadyImage := map[string]any{
 		"type":      "image_url",
@@ -35,10 +43,10 @@ func TestNormalizeContentParts(t *testing.T) {
 		{"reasoning-only becomes empty string", []any{reasoning}, ""},
 		{"image translated, text kept, stays structured", []any{text, zcodeImage}, []any{
 			text,
-			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,QUJD"}},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": pngDataURL()}},
 		}},
 		{"anthropic source assembled", []any{anthropicImage}, []any{
-			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/jpeg;base64,WFla"}},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/jpeg;base64,/9j/"}},
 		}},
 		{"standard image untouched + reasoning dropped", []any{reasoning, alreadyImage}, []any{alreadyImage}},
 		{"no-data image kept verbatim (no fabrication)", []any{noDataImage}, []any{noDataImage}},
@@ -74,14 +82,14 @@ func TestEnsureUpstreamMessagesStripsReasoningAndTranslatesImages(t *testing.T) 
 		{"role": "system", "content": "be helpful"},
 		{"role": "user", "content": []any{
 			map[string]any{"type": "text", "text": "what color?"},
-			map[string]any{"type": "image", "dataUrl": "data:image/png;base64,QUJD", "mediaType": "image/png"},
+			map[string]any{"type": "image", "dataUrl": pngDataURL(), "mediaType": "image/png"},
 		}},
 		{"role": "assistant", "content": []any{
 			map[string]any{"type": "reasoning", "text": "pondering"},
 			map[string]any{"type": "text", "text": "pink"},
 		}},
 		{"role": "tool", "tool_call_id": "call_1", "content": []any{
-			map[string]any{"type": "image", "dataUrl": "data:image/png;base64,REFU"},
+			map[string]any{"type": "image", "dataUrl": pngDataURL('A')},
 		}},
 	}
 	out := EnsureUpstreamMessages(msgs)
@@ -96,8 +104,8 @@ func TestEnsureUpstreamMessagesStripsReasoningAndTranslatesImages(t *testing.T) 
 			t.Fatalf("assistant should collapse to string, got %#v", m["content"])
 		}
 	}
-	assertHasImageURL(t, findContent(out, "user"), "data:image/png;base64,QUJD")
-	assertHasImageURL(t, findContent(out, "tool"), "data:image/png;base64,REFU")
+	assertHasImageURL(t, findContent(out, "user"), pngDataURL())
+	assertHasImageURL(t, findContent(out, "tool"), pngDataURL('A'))
 }
 
 func TestEnsureUpstreamMessagesAdoptsCamelCaseKeys(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -745,17 +746,31 @@ func firstKey(m map[string]any, keys ...string) (any, bool) {
 //     while the standard image_url shape returns 200 and the model sees
 //     the image); parts with no extractable data stay verbatim (let the
 //     upstream raise a readable error - no fabrication);
-//  3. collapses all-text part lists to a plain string (maximally
+//  3. egress autopsy: every outbound image data URL (standard image_url
+//     parts and translation products alike) must pass imageDataURLIssue;
+//     undecodable / non-image payloads are stripped and replaced with a
+//     text placeholder (WARN recorded). A deterministic 400 poison sitting
+//     in history would otherwise be re-sent every turn and permanently
+//     kill the session - dropping one image is the lesser loss;
+//  4. collapses all-text part lists to a plain string (maximally
 //     compatible wire form);
-//  4. unknown types stay verbatim (no silent semantic guessing; they
+//  5. unknown types stay verbatim (no silent semantic guessing; they
 //     surface as loud, readable upstream errors).
-//
+
 // Returns any: string (all-text collapsed / stripped empty) or []any
 // (still structured).
 func normalizeContentParts(parts []any) any {
 
 	out := make([]any, 0, len(parts))
 	allText := true
+	placeholderAdded := false
+	dropBadImage := func(url, issue string) {
+		warnDroppedImage(url, issue)
+		if !placeholderAdded {
+			out = append(out, map[string]any{"type": "text", "text": droppedImagePlaceholder})
+			placeholderAdded = true
+		}
+	}
 	for _, part := range parts {
 		m, ok := part.(map[string]any)
 		if !ok {
@@ -767,14 +782,29 @@ func normalizeContentParts(parts []any) any {
 		case "reasoning":
 			continue
 		case "image":
-			allText = false
-			if url, found := extractImageDataURL(m); found {
-				out = append(out, map[string]any{
-					"type":      "image_url",
-					"image_url": map[string]any{"url": url},
-				})
+			url, found := extractImageDataURL(m)
+			if !found {
+				allText = false
+				out = append(out, part)
 				continue
 			}
+			if issue := imageDataURLIssue(url); issue != "" {
+				dropBadImage(url, issue)
+				continue
+			}
+			allText = false
+			out = append(out, map[string]any{
+				"type":      "image_url",
+				"image_url": map[string]any{"url": url},
+			})
+		case "image_url":
+			if url, ok := imageURLString(m); ok {
+				if issue := imageDataURLIssue(url); issue != "" {
+					dropBadImage(url, issue)
+					continue
+				}
+			}
+			allText = false
 			out = append(out, part)
 		default:
 			if typ, _ := m["type"].(string); typ != "text" {
@@ -818,6 +848,105 @@ func extractImageDataURL(part map[string]any) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// droppedImagePlaceholder replaces every image that failed the egress
+// autopsy: the message never collapses to empty, and the model can see
+// that an image was here but the proxy confirmed it cannot be sent -
+// rather than it vanishing silently.
+const droppedImagePlaceholder = "[image removed: invalid image data]"
+
+// imageDataURLIssue runs the egress autopsy on an outbound image data URL:
+// returns "" when healthy, otherwise the reason. The criteria come from
+// probes: undecodable base64, and valid base64 of non-image bytes - both
+// draw a deterministic upstream 400/11133 (z.ai: 1210). A poison sitting
+// in history would be re-sent every turn and permanently kill the session.
+// Remote URLs (http/https etc.) cannot be autopsied locally and pass
+// through - fetching and validating them is the upstream's job.
+func imageDataURLIssue(url string) string {
+	if !strings.HasPrefix(strings.ToLower(url), "data:") {
+		return ""
+	}
+	comma := strings.IndexByte(url, ',')
+	if comma < 0 {
+		return "malformed data url"
+	}
+	if !strings.Contains(strings.ToLower(url[:comma]), ";base64") {
+		return "non-base64 data url"
+	}
+	data, err := decodeBase64Lenient(url[comma+1:])
+	if err != nil {
+		return "undecodable base64"
+	}
+	if !hasImageMagic(data) {
+		return "magic bytes not an image"
+	}
+	return ""
+}
+
+// decodeBase64Lenient tolerates whitespace, line breaks and missing
+// padding: the "cannot decode" criterion must stay as wide as possible -
+// any form the upstream decoder accepts is not a bad image.
+func decodeBase64Lenient(s string) ([]byte, error) {
+	cleaned := strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r':
+			return -1
+		}
+		return r
+	}, s)
+	if data, err := base64.StdEncoding.DecodeString(cleaned); err == nil {
+		return data, nil
+	}
+	return base64.RawStdEncoding.DecodeString(cleaned)
+}
+
+// hasImageMagic recognizes the PNG/JPEG/GIF/WEBP file headers - the
+// formats agent clients actually produce (reads, screenshots). Exotic
+// formats (e.g. AVIF) being misclassified and stripped is an accepted
+// tradeoff: losing one image (with a placeholder and a WARN) beats the
+// whole session being poisoned by deterministic 400s.
+func hasImageMagic(data []byte) bool {
+	switch {
+	case len(data) >= 4 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G':
+		return true
+	case len(data) >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF:
+		return true
+	case len(data) >= 4 && string(data[:4]) == "GIF8":
+		return true
+	case len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP":
+		return true
+	}
+	return false
+}
+
+// imageURLString extracts the url of a standard image_url part; non-map /
+// missing-field shapes return false and stay verbatim (no semantic
+// guessing - the loud-fail principle).
+func imageURLString(part map[string]any) (string, bool) {
+	iu, ok := part["image_url"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	url, ok := iu["url"].(string)
+	return url, ok
+}
+
+func declaredDataURLMIME(url string) string {
+	lower := strings.ToLower(url)
+	if !strings.HasPrefix(lower, "data:") {
+		return ""
+	}
+	rest := lower[len("data:"):]
+	if i := strings.IndexAny(rest, ";,"); i >= 0 {
+		return rest[:i]
+	}
+	return rest
+}
+
+func warnDroppedImage(url, issue string) {
+	slog.Default().Warn("dropped invalid image part",
+		"reason", issue, "declared_mime", declaredDataURLMIME(url), "url_len", len(url))
 }
 
 func (c *Client) Complete(ctx context.Context, opts ChatOptions) (Result, error) {
