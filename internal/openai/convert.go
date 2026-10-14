@@ -242,6 +242,24 @@ type StreamChunk struct {
 	Usage   *Usage   `json:"usage,omitempty"`
 }
 
+// FinishReasonFromTurn maps the provider turn's real stop reason onto the
+// OpenAI finish_reason instead of deriving it from the content shape:
+// length (cut by max_tokens) and content_filter (safety stop) pass through
+// truthfully. Rewriting them to "stop" makes truncation indistinguishable
+// from a complete answer - lying on the upstream's behalf.
+func FinishReasonFromTurn(turn provider.Turn) string {
+	switch strings.ToLower(turn.StopReason) {
+	case "content_filter":
+		return "content_filter"
+	case "length", "max_tokens":
+		return "length"
+	}
+	if len(turn.ToolUses) > 0 {
+		return "tool_calls"
+	}
+	return "stop"
+}
+
 func FromTurn(turn provider.Turn, id, model string) ChatCompletion {
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl_%d", time.Now().UnixMilli())
@@ -257,10 +275,7 @@ func FromTurn(turn provider.Turn, id, model string) ChatCompletion {
 			},
 		})
 	}
-	finish := "stop"
-	if len(toolCalls) > 0 {
-		finish = "tool_calls"
-	}
+	finish := FinishReasonFromTurn(turn)
 	var content any = turn.Text
 	if turn.Text == "" {
 		content = nil

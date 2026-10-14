@@ -1351,6 +1351,16 @@ func (a *accumulator) snapshot(promptFn func() string) Turn {
 	for _, frag := range a.fragments {
 		input := map[string]any{}
 		if args, ok := frag.Input["__args"].(string); ok && args != "" {
+			// The upstream stream was cut mid-arguments: wrapping the raw
+			// half-string as {"input": <half>} would emit a structurally
+			// valid tool call with fabricated arguments that an agent would
+			// then execute. Drop it and leave a WARN; if the turn ends up
+			// empty, the empty-turn guard takes over.
+			if looksTruncatedToolArgs(args) {
+				slog.Default().Warn("dropping truncated tool call arguments",
+					"tool", strutil.First(frag.Name, "?"), "args_len", len(args))
+				continue
+			}
 			input = normalizeToolInput(args)
 		} else {
 			for k, v := range frag.Input {
@@ -1726,6 +1736,25 @@ func firstText(values ...any) string {
 		}
 	}
 	return ""
+}
+
+// looksTruncatedToolArgs reports arguments that were cut mid-stream: they
+// start like JSON (object or array prefix) and the parse fails with an
+// unexpected end of input - the fingerprint of a stream teardown in the
+// middle of the arguments. Malformed-but-complete payloads (trailing
+// comma, single quotes, trailing garbage) are NOT truncation; they keep
+// the legacy {"input": ...} fallback, as do non-JSON string arguments.
+func looksTruncatedToolArgs(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" || (!strings.HasPrefix(t, "{") && !strings.HasPrefix(t, "[")) {
+		return false
+	}
+	var v any
+	err := json.Unmarshal([]byte(t), &v)
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "unexpected end of JSON input")
 }
 
 func normalizeToolInput(values ...any) map[string]any {
