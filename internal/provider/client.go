@@ -889,6 +889,22 @@ func imageDataURLIssue(url string) string {
 	return decodeImageBody(data)
 }
 
+// maxAutopsyPixels is the autopsy's own pixel budget: Go decoders reserve
+// the full pixel buffer for the declared dimensions before reading data -
+// a decompression bomb lying 20000x20000 with a few dozen IDAT bytes
+// makes the proxy allocate 1.5GB and OOM (measured), and "the header
+// lies" is exactly this bug family's disease. Over-budget images skip
+// the local decode and pass through: the upstream has its own guards and
+// should be the one to reject them, not a victim here.
+const maxAutopsyPixels = 64 << 20
+
+// overPixelBudget reports whether the declared dimensions exceed the autopsy
+// budget. The comparison uses 64-bit arithmetic so extreme lying dimensions
+// cannot wrap the product and sneak past the gate.
+func overPixelBudget(w, h int) bool {
+	return uint64(w)*uint64(h) > uint64(maxAutopsyPixels)/4
+}
+
 // decodeImageBody fully decodes the image body: passing the magic check
 // only proves the label does not lie, and the production poison was a
 // counterexample - a PNG with a valid signature, valid chunk structure and
@@ -897,18 +913,41 @@ func imageDataURLIssue(url string) string {
 // deterministically (workbuddy 11135 "replace the image" / international
 // 11133 / z.ai 1210). Criteria align with the upstream: route by magic to
 // the Go stdlib full decode; anything that does not decode fully is bad.
+// The size gate runs first: over-budget declarations pass through without
+// staking the whole pipeline on one mad image.
 // Known limit: WEBP has no stdlib decoder and keeps the magic-only bound.
 func decodeImageBody(data []byte) string {
 	switch {
 	case len(data) >= 4 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G':
+		cfg, err := png.DecodeConfig(bytes.NewReader(data))
+		if err != nil {
+			return "undecodable image body"
+		}
+		if overPixelBudget(cfg.Width, cfg.Height) {
+			return ""
+		}
 		if _, err := png.Decode(bytes.NewReader(data)); err != nil {
 			return "undecodable image body"
 		}
 	case len(data) >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF:
+		cfg, err := jpeg.DecodeConfig(bytes.NewReader(data))
+		if err != nil {
+			return "undecodable image body"
+		}
+		if overPixelBudget(cfg.Width, cfg.Height) {
+			return ""
+		}
 		if _, err := jpeg.Decode(bytes.NewReader(data)); err != nil {
 			return "undecodable image body"
 		}
 	case len(data) >= 4 && string(data[:4]) == "GIF8":
+		cfg, err := gif.DecodeConfig(bytes.NewReader(data))
+		if err != nil {
+			return "undecodable image body"
+		}
+		if overPixelBudget(cfg.Width, cfg.Height) {
+			return ""
+		}
 		if _, err := gif.Decode(bytes.NewReader(data)); err != nil {
 			return "undecodable image body"
 		}

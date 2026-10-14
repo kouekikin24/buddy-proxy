@@ -58,6 +58,28 @@ func pngChunk(typ string, data []byte) []byte {
 	return b.Bytes()
 }
 
+// bombPNGDataURL builds a "decompression bomb" shape: an IHDR lying w x h
+// with only a few dozen IDAT bytes. Go decoders reserve pixels for the
+// declared dimensions first (20000x20000 -> 1.5GB), so the autopsy itself
+// would die first - the pixel-budget gate must skip the local decode and
+// pass it through (issue "").
+func bombPNGDataURL(w, h int) string {
+	var ihdr bytes.Buffer
+	_ = binary.Write(&ihdr, binary.BigEndian, uint32(w))
+	_ = binary.Write(&ihdr, binary.BigEndian, uint32(h))
+	ihdr.Write([]byte{8, 6, 0, 0, 0})
+	var idat bytes.Buffer
+	zw := zlib.NewWriter(&idat)
+	_, _ = zw.Write([]byte{0, 0, 0, 0})
+	_ = zw.Close()
+	var buf bytes.Buffer
+	buf.WriteString("\x89PNG\r\n\x1a\n")
+	buf.Write(pngChunk("IHDR", ihdr.Bytes()))
+	buf.Write(pngChunk("IDAT", idat.Bytes()))
+	buf.Write(pngChunk("IEND", nil))
+	return dataURL("image/png", buf.Bytes())
+}
+
 // poisonPNGDataURL builds the same shape as the production poison: an
 // IHDR declaring 900x360 RGBA, valid signature and CRCs for every
 // chunk, while the IDAT decompresses to only 1/3 of the declared
@@ -126,6 +148,9 @@ func TestImageDataURLIssue(t *testing.T) {
 		{"too short for any magic", dataURL("image/png", []byte{0x89, 'P'}), "magic bytes not an image"},
 		{"header-valid pixel-shortage poison (production shape)", poisonPNGDataURL(), "undecodable image body"},
 		{"truncated jpeg body", truncatedJPEGURL(), "undecodable image body"},
+		{"decompression bomb passes unautopsied (pixel-budget gate)", bombPNGDataURL(20000, 20000), ""},
+		{"in-budget broken png still caught (gate no weakening)", bombPNGDataURL(4000, 3000), "undecodable image body"},
+		{"extreme lying dims rejected without panic (overflow-safe gate)", bombPNGDataURL(0x7FFFFFFF, 0x7FFFFFFF), "undecodable image body"},
 		{"missing comma", "data:image/png;base64", "malformed data url"},
 		{"non-base64 data url", "data:image/png,abcd", "non-base64 data url"},
 		{"remote https url passes through", "https://example.com/x.png", ""},
@@ -322,5 +347,18 @@ func TestStripImagesForReplay(t *testing.T) {
 	out2, changed2 := StripImagesForReplay([]map[string]any{{"role": "user", "content": "plain"}})
 	if changed2 || out2[0]["content"] != "plain" {
 		t.Fatal("imageless request must be a no-op")
+	}
+}
+
+func TestOverPixelBudget(t *testing.T) {
+	// Extreme lying dimensions must not wrap the product past the gate.
+	if !overPixelBudget(0x7FFFFFFF, 0x7FFFFFFF) {
+		t.Fatal("max-int32 dims must exceed the pixel budget")
+	}
+	if !overPixelBudget(20000, 20000) {
+		t.Fatal("400M declared pixels must exceed the budget")
+	}
+	if overPixelBudget(4000, 3000) {
+		t.Fatal("12M pixels must stay within the budget (no gate weakening)")
 	}
 }
