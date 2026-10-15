@@ -17,6 +17,10 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
+	// Install the process logger as the slog default: package-level diagnostics
+	// (e.g. provider drop warnings) log through slog.Default() and must follow
+	// the same JSON stream instead of the stdlib text default on stderr.
+	slog.SetDefault(logger)
 	cfg := config.Load()
 	generatedKey := false
 
