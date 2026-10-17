@@ -55,17 +55,16 @@ type scriptedChatTransport struct {
 	billingCalls  []string
 	byAuth        map[string]int
 	creditsByAuth map[string]float64
-	// resetBodyByAuth maps token -> bytes to emit before the stream is torn
-	// down (empty = reset before any frame). Response is 200 + SSE headers.
+	// resetBodyByAuth 按 token 映射"流被掐断前先发出的字节"（空=任何帧之前就 reset）。
+	// 响应为 200 + SSE 头。
 	resetBodyByAuth map[string]string
-	// rawBodyByAuth maps token -> exact SSE body to return with 200 + SSE
-	// headers (used to replay upstream "polite" terminations: finish frames,
-	// empty content, zeroed usage).
+	// rawBodyByAuth 按 token 映射完整 SSE 响应体（200 + SSE 头），用于复现上游
+	// "体面收尾"：finish 帧、空正文、全零 usage。
 	rawBodyByAuth map[string]string
 }
 
-// resetReader yields `data` then fails with `reset`: an upstream connection
-// torn down mid-response (transport RST after response headers).
+// resetReader 先吐出 `data` 再以 `reset` 失败：模拟上游连接在响应中途被掐断
+// （收到响应头后的传输层 RST）。
 type resetReader struct {
 	data  string
 	off   int
@@ -372,9 +371,8 @@ func TestCompleteFromPoolReplaysAfterResetBeforeFirstFrame(t *testing.T) {
 	if a.ID == b.ID {
 		t.Fatal("fixture accounts must differ")
 	}
-	// token-a: upstream is torn down before any data frame (edge idle kill);
-	// token-b: healthy. The client has received nothing from attempt a (the
-	// proxy aggregates the turn), so replay on the next account is invisible.
+	// token-a：任何数据帧之前就被掐断（边缘空闲回收）；token-b：健康。
+	// 客户端从 a 没收到任何内容（反代聚合整轮），换号重放不可见。
 	transport := &scriptedChatTransport{resetBodyByAuth: map[string]string{"token-a": ""}}
 	svc.Provider.HTTP = &http.Client{Transport: transport}
 
@@ -408,8 +406,8 @@ func TestNoReplayAfterResetWithDeliveredFrame(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	// token-a: one data frame delivered, then reset. Out of scope for the
-	// pre-first-frame replay; must surface as an error without burning b.
+	// token-a：已下发一帧正文后 reset。不属于"首帧前重放"范畴；必须以错误
+	// 收场，且不得消耗 token-b。
 	transport := &scriptedChatTransport{resetBodyByAuth: map[string]string{
 		"token-a": "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
 	}}
@@ -432,9 +430,8 @@ func TestNoReplayAfterResetWithDeliveredFrame(t *testing.T) {
 }
 
 func TestCompleteFromPoolReplaysAfterThinkingStreamThenReset(t *testing.T) {
-	// Production evidence class: reasoning streamed for minutes, hard reset
-	// with zero text/tool delivered. Reasoning is auxiliary for agent clients,
-	// so the replay stays invisible and must be allowed.
+	// 生产证据类：思考流了几分钟，随后硬重置，零正文/零工具下发。思考对 agent
+	// 客户端属辅助展示，重放不可见，必须允许。
 	dir := t.TempDir()
 	svc := New(config.Config{Site: "domestic", AccountsPath: dir + "/accounts.json"}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	t.Cleanup(func() { _ = svc.Close() })
@@ -471,10 +468,9 @@ func TestCompleteFromPoolReplaysAfterThinkingStreamThenReset(t *testing.T) {
 }
 
 func TestCompleteFromPoolResetsReplayBudget(t *testing.T) {
-	// Every account resets the stream before the first content. The replay
-	// chain must stop after maxResetReplays (2) replays - 3 total upstream
-	// calls - instead of cycling the whole pool at 15+ minutes each (a
-	// measured 33-minute turn burned two silent replays).
+	// 所有账号都在首内容前 reset。重放链必须在 maxResetReplays（2 次）后停止
+	// ——总共 3 发上游请求——而不是按每发 15+ 分钟遍历整个号池
+	// （实测一个 33 分钟回合烧掉两次静默重放）。
 	dir := t.TempDir()
 	svc := New(config.Config{Site: "domestic", AccountsPath: dir + "/accounts.json"}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	t.Cleanup(func() { _ = svc.Close() })
@@ -503,8 +499,8 @@ func TestCompleteFromPoolResetsReplayBudget(t *testing.T) {
 	}
 }
 
-// sseEmptyFinish is the soft-truncation fingerprint: upstream terminates the
-// stream "politely" (finish_reason=stop + [DONE]) with zero content.
+// sseEmptyFinish 是软截断的指纹：上游"体面"收尾（finish_reason=stop +
+// [DONE]）但零内容。
 const sseEmptyFinish = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
 
 func TestCompleteFromPoolReplaysOnceAfterEmptyCompletedTurn(t *testing.T) {
@@ -526,7 +522,7 @@ func TestCompleteFromPoolReplaysOnceAfterEmptyCompletedTurn(t *testing.T) {
 	if a.ID == b.ID {
 		t.Fatal("fixture accounts must differ")
 	}
-	// token-a: empty completed turn (soft truncation); token-b: healthy.
+	// token-a：空 completed 回合（软截断）；token-b：健康。
 	transport := &scriptedChatTransport{rawBodyByAuth: map[string]string{"token-a": sseEmptyFinish}}
 	svc.Provider.HTTP = &http.Client{Transport: transport}
 
@@ -557,9 +553,8 @@ func TestEmptyCompletedTurnReplayIsBoundedToOne(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Every account returns the empty completed turn: exactly ONE switch
-	// replay is allowed, then the error surfaces (empty completions recur;
-	// chaining all accounts only burns time).
+	// 所有账号都返回空 completed 回合：只允许一次换号重放，随后错误上抛
+	// （空回合会复发，连环换号只是烧时间）。
 	transport := &scriptedChatTransport{rawBodyByAuth: map[string]string{
 		"token-a": sseEmptyFinish,
 		"token-b": sseEmptyFinish,
@@ -577,9 +572,8 @@ func TestEmptyCompletedTurnReplayIsBoundedToOne(t *testing.T) {
 	if !strings.Contains(err.Error(), "empty completed turn") {
 		t.Fatalf("error must carry the empty-turn marker, got %v", err)
 	}
-	// Regression guard: the error string feeds Contains-based classifiers
-	// (11101/11140/429/502...). Any run of 3+ digits could forge a match, so
-	// diagnostic counters must live in logs, never in this string.
+	// 回归守卫：错误串会喂给 Contains 型分类器（11101/11140/429/502...）。
+	// 任何 3 位以上数字串都可能伪造命中，诊断计数只能进日志、绝不进错误串。
 	if m := regexp.MustCompile(`\d{3,}`).FindString(err.Error()); m != "" {
 		t.Fatalf("empty-turn error must not embed numeric runs (classifier substring hazard): %q in %v", m, err)
 	}

@@ -122,10 +122,8 @@ type Turn struct {
 	Delivered bool
 }
 
-// isEmptyCompletedTurn reports a "politely closed but empty" turn: the
-// stream ended normally (no error frames, a termination signal) yet
-// carries neither text nor tool calls. Content filter / refusal are
-// legitimate silences and stay exempt.
+// isEmptyCompletedTurn 判定"体面收尾的废回合"：流正常结束（无错误帧、有终止
+// 信号）但既无正文也无工具调用。安全拦截/拒绝属合法噤声，不判废。
 func isEmptyCompletedTurn(t Turn) bool {
 	// 已交付过内容的回合不判废：snapshot 可能因丢弃截断工具而变空，但客户端
 	// 已经收到过增量，重放会产生重复/错乱的工具调用（作者 P1）。
@@ -813,19 +811,14 @@ func (c *Client) Complete(ctx context.Context, opts ChatOptions) (Result, error)
 		c.logUpstreamFailure(result.Turn.Errors[0], resp.StatusCode, body, opts, endpoint, domain, region, model)
 		return Result{}, fmt.Errorf("%s", result.Turn.Errors[0])
 	}
-	// Upstream soft truncation: the generation is aborted mid-flight but
-	// the stream closes politely - a synthesized finish_reason=stop +
-	// [DONE] with zero text, zero tool calls and a zeroed usage frame.
-	// The proxy sees a successful completion; the agent receives an empty
-	// turn and the session silently stalls. The predicate follows the
-	// OpenAI Agents SDK empty-turn validation family (which itself still
-	// lets the stop-shaped empty turn through, the gap closed here);
-	// content_filter / refusal remain legitimate silences.
+	// 上游软截断：生成中途被中止，但流以合成的 finish_reason=stop + [DONE]
+	// 收尾——零正文、零工具调用、usage 全零。反代视角是"成功完成"，agent 收到
+	// 的却是空回合，会话无声停死。判废标准沿用 OpenAI Agents SDK 的空回合校验
+	// 一族（SDK 本身仍放行 stop 形态的空回合，这里补上）；content_filter /
+	// refusal 属合法噤声，不判废。
 	if isEmptyCompletedTurn(result.Turn) {
-		// Diagnostic counters go to the WARN log only, never into the error
-		// string: downstream retry/cooldown classification is Contains-based
-		// substring matching (11101/11140/429/502...), and a bare numeric
-		// run could forge a match.
+		// 诊断计数只进 WARN 日志，绝不进错误串：下游的重试/冷却判定是
+		// Contains 型子串匹配（11101/11140/429/502...），裸数字可能伪造命中。
 		c.logUpstreamFailure(fmt.Sprintf("empty completed turn (finish=%q thinking_len=%d usage_prompt=%d)",
 			result.Turn.StopReason, len(result.Turn.Thinking), result.Turn.Usage.PromptTokens),
 			resp.StatusCode, body, opts, endpoint, domain, region, model)
@@ -1014,11 +1007,9 @@ func (c *Client) readSSE(body io.Reader, opts ChatOptions) (Result, error) {
 	var (
 		eventCount int
 		deltaCount int
-		// sawContent: true once any text or tool-call delta has been forwarded
-		// to the client. Reasoning (thinking) deltas do not count - agent
-		// clients consume text + tool calls and treat reasoning as auxiliary
-		// display, so replaying after a thinking-only cut cannot duplicate
-		// anything the user saw.
+		// sawContent：正文或工具增量是否解析到过。思考（thinking）不算——
+		// agent 客户端只消费正文+工具，思考属辅助展示，思考流被掐后重放
+		// 不会让用户看到重复内容。用途=断流重放的保守判定。
 		// 用途=断流重放的保守判定（沿用原语义）。
 		sawContent bool
 		// delivered: 内容是否**真的下发给了客户端**（回调非空且该事件会被转发）。
@@ -1110,15 +1101,10 @@ func (c *Client) readSSE(body io.Reader, opts ChatOptions) (Result, error) {
 			break
 		}
 		if err != nil {
-			// The upstream stream was torn down by the transport (idle
-			// reclamation / connection reset) before any text or tool-call
-			// delta was forwarded. At this point the client has received at
-			// most the role frame, keep-alive comments and reasoning deltas
-			// (reasoning replay is harmless for agent clients), so a replay
-			// is invisible and the failover layer may redial on another
-			// account (see reRetryNextAccount). Once text/tools were
-			// delivered, a replay would duplicate visible content and stays
-			// out of scope.
+			// 上游流在任何正文/工具增量之前被传输层掐断（边缘空闲回收/连接重置）。
+			// 此刻客户端最多只收到 role 起始帧、心跳注释与思考流（思考重复无害），
+			// 重放不可见，交给服务层换号重试（见 reRetryNextAccount）。
+			// 正文/工具已下发则不标记：重放会让客户端看到重复内容。
 			if !sawContent {
 				return Result{}, fmt.Errorf("CodeBuddy chat completion stream reset before first content: %w", err)
 			}
@@ -1397,11 +1383,9 @@ func (a *accumulator) snapshot(promptFn func() string) Turn {
 	for _, frag := range a.fragments {
 		input := map[string]any{}
 		if args, ok := frag.Input["__args"].(string); ok && args != "" {
-			// The upstream stream was cut mid-arguments: wrapping the raw
-			// half-string as {"input": <half>} would emit a structurally
-			// valid tool call with fabricated arguments that an agent would
-			// then execute. Drop it and leave a WARN; if the turn ends up
-			// empty, the empty-turn guard takes over.
+			// 上游流断在工具参数中途：把半截 JSON 包成 {"input":原文} 外发，
+			// 等于伪造一个参数残缺的"合法"工具调用，agent 会拿它去执行。
+			// 丢弃并记 WARN；若因此整轮变空，由空回合守卫接管。
 			if looksTruncatedToolArgs(args) {
 				slog.Default().Warn("dropping truncated tool call arguments",
 					"tool", strutil.First(frag.Name, "?"), "args_len", len(args))
@@ -1784,12 +1768,10 @@ func firstText(values ...any) string {
 	return ""
 }
 
-// looksTruncatedToolArgs reports arguments that were cut mid-stream: they
-// start like JSON (object or array prefix) and the parse fails with an
-// unexpected end of input - the fingerprint of a stream teardown in the
-// middle of the arguments. Malformed-but-complete payloads (trailing
-// comma, single quotes, trailing garbage) are NOT truncation; they keep
-// the legacy {"input": ...} fallback, as do non-JSON string arguments.
+// looksTruncatedToolArgs 判定参数是否被截断：形似 JSON（对象/数组起手）但解析
+// 失败于意外的输入结束——上游流断在参数中途的指纹。完整但格式非法的载荷
+// （尾逗号、单引号、尾部垃圾）不算截断，沿用 {"input": ...} 兜底；
+// 非 JSON 的字符串参数同样走兜底。
 func looksTruncatedToolArgs(s string) bool {
 	t := strings.TrimSpace(s)
 	if t == "" || (!strings.HasPrefix(t, "{") && !strings.HasPrefix(t, "[")) {

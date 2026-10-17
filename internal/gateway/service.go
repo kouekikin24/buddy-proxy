@@ -43,22 +43,17 @@ var (
 	// 包级预编译，避免热路径（每个 chat 请求）重复编译正则。
 	reProviderModel = regexp.MustCompile(`(?i)^codebuddy(?:(?:/|:)(.*))?$`)
 	reAuthFailure   = regexp.MustCompile(`(?i)(?:\b401\b|\b403\b|unauthori[sz]ed|forbidden|token|credential|auth|login|not authenticated|未登录|登录|凭证)`)
-	// "transport error" = Do-phase connection failure (before response headers);
-	// "stream reset before first content" = upstream tore the stream down after
-	// the 200 headers but before any text/tool delta was forwarded
-	// (provider.readSSE marks it). Neither has delivered anything the client
-	// can consume, so a replay is invisible and redialing another account
-	// heals the turn.
+	// "transport error" = Do 阶段（响应头之前）的连接层失败；"stream reset before
+	// first content" = 已收到 200 头但上游在任何正文/工具增量之前掐断流
+	// （provider.readSSE 标记，思考流不算增量）。两者客户端都尚未收到可消费的
+	// 内容，重放不可见，换号重拨即可自愈。
 	reRetryNextAccount = regexp.MustCompile(`(?i)\b429\b|\b502\b|\b503\b|\b504\b|rate.?limit|too many requests|site mismatch|invalid request|transport error|stream reset before first content`)
 )
 
-// maxResetReplays bounds the "reset before first content" replay chain to 2
-// replays (3 upstream calls). Each such replay restarts the thinking phase
-// from scratch - measured 15-20 minutes of wall clock per attempt - and
-// re-bills the full prompt against a cold account cache (one measured chain
-// collapsed the cache hit rate from 99% to 6.5%). Cycling every account
-// could stitch hours from a single request; past the budget the last error
-// is surfaced to the client instead.
+// maxResetReplays 慢掐重放预算：最多 2 次重放（共 3 发）。每次重放都会让思考
+// 阶段从头再来（实测 15-20 分钟墙钟），并对冷缓存重烧全量 prompt（实测一条链
+// 把缓存命中率从 99% 打到 6.5%）。遍历所有账号能把单个请求拼成数小时；超预算
+// 即把最后一次错误交还客户端。
 const maxResetReplays = 2
 
 type Stats struct {
@@ -587,20 +582,17 @@ func (s *Service) shouldRetryNextAccount(err error, selection accounts.Selection
 	if strings.Contains(msg, "11140") || strings.Contains(msg, "request illegal") {
 		return false
 	}
-	// Empty completed turn (soft truncation): allow exactly ONE account
-	// switch replay. Reasoning-degeneration empties recur (public
-	// measurement ~29%), so chaining accounts only burns client patience;
-	// the second empty surfaces as a loud error. The failing account is
-	// not penalized - the lie is in the upstream termination frame.
+	// 空 completed 回合（软截断）：只允许一次换号重放。推理退化型空回合会复发
+	// （公开实测 ~29%），连环换号只是烧客户端耐心；第二次仍空即 loud fail。
+	// 不罚号——说谎的是上游的收尾帧，不是账号。
 	if strings.Contains(msg, "empty completed turn") {
 		return opts.RetryDepth == 0
 	}
 	if billing.IsQuotaExhaustedError(err) {
 		return true
 	}
-	// Bound the reset-replay chain: each replay can burn 15-20 minutes of
-	// wall clock (thinking restarts), so past the budget stop switching
-	// and surface the last error to the client.
+	// 限制慢掐重放链：每次重放可烧 15-20 分钟墙钟（思考从头再来），超预算即
+	// 停止换号、把最后一次错误交给客户端。
 	// 传输层失败（transport error）与慢掐同属"传输层重放"，共用同一预算：
 	// 否则四个账号全部 connection refused 会实际发出四次请求（而非最多三次）。
 	if isTransportReplayError(msg) {

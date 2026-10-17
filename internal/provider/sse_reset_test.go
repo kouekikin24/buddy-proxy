@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-// resetReader yields `data` and then fails with `reset`, simulating an
-// upstream connection torn down mid-response (transport RST after headers).
+// resetReader 先吐出 `data` 再以 `reset` 失败，模拟上游连接在响应中途被掐断
+// （收到响应头后的传输层 RST）。
 type resetReader struct {
 	data  string
 	off   int
@@ -27,7 +27,7 @@ var errUpstreamReset = errors.New("read tcp 10.0.0.2:52352->43.160.158.125:443: 
 
 func TestReadSSEResetBeforeFirstContentMarksReplayable(t *testing.T) {
 	c := &Client{}
-	// Comment-only bytes (keep-alives) must not count as content.
+	// 纯注释字节（心跳）不得算作内容。
 	body := &resetReader{data: ": keep-alive\n\n", reset: errUpstreamReset}
 	_, err := c.readSSE(body, ChatOptions{})
 	if err == nil {
@@ -42,9 +42,8 @@ func TestReadSSEResetBeforeFirstContentMarksReplayable(t *testing.T) {
 }
 
 func TestReadSSEThinkingOnlyThenResetMarksReplayable(t *testing.T) {
-	// Production evidence class: reasoning streamed for minutes, then a hard
-	// reset with zero text/tool delivered. Reasoning is auxiliary for agent
-	// clients (they consume text + tools), so the replay stays invisible.
+	// 生产证据类：思考流了几分钟，随后硬重置，零正文/零工具下发。思考对 agent
+	// 客户端属辅助展示（它们只消费正文+工具），重放不可见。
 	c := &Client{}
 	body := &resetReader{
 		data:  "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"long thinking...\"}}]}\n\n",

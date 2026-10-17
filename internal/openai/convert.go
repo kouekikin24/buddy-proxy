@@ -242,11 +242,9 @@ type StreamChunk struct {
 	Usage   *Usage   `json:"usage,omitempty"`
 }
 
-// FinishReasonFromTurn maps the provider turn's real stop reason onto the
-// OpenAI finish_reason instead of deriving it from the content shape:
-// length (cut by max_tokens) and content_filter (safety stop) pass through
-// truthfully. Rewriting them to "stop" makes truncation indistinguishable
-// from a complete answer - lying on the upstream's behalf.
+// FinishReasonFromTurn 把 provider 回合的真实终止原因映射为 OpenAI finish_reason，
+// 而不是按内容形状反推：length（被 max_tokens 截断）与 content_filter（安全
+// 拦截）如实透传。改写成 "stop" 会让截断与完整回答无法区分——等于替上游撒谎。
 func FinishReasonFromTurn(turn provider.Turn) string {
 	switch strings.ToLower(turn.StopReason) {
 	case "content_filter":

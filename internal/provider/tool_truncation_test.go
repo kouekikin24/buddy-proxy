@@ -42,7 +42,7 @@ func TestSnapshotKeepsValidAndLegacyToolArgs(t *testing.T) {
 	if len(turn.ToolUses) != 2 {
 		t.Fatalf("valid and legacy args must survive, got %+v", turn.ToolUses)
 	}
-	// Map iteration order is unspecified: look up by tool name instead of index.
+	// map 迭代顺序不确定：按工具名查找，不要按索引。
 	byName := map[string]ToolUse{}
 	for _, tu := range turn.ToolUses {
 		byName[tu.Name] = tu
