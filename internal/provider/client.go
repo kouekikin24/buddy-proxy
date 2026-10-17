@@ -89,6 +89,9 @@ type ChatOptions struct {
 	OnDelta             func(string)
 	OnThinkingDelta     func(string)
 	OnEvent             func(Event)
+	// DeliverToolDeltas 表示调用方真的会把 tool_call_delta 转发给客户端。
+	// 只有 Responses 流式入口为 true；chat 流式只转发 tool_use，非流式无回调。
+	DeliverToolDeltas bool
 }
 
 type Event struct {
@@ -112,6 +115,36 @@ type Turn struct {
 	Errors     []string
 	StopReason string
 	Usage      Usage
+	// Delivered 表示正文或工具增量**真的下发给了客户端**（回调非空且该事件
+	// 会被转发）。重放判定必须看它：snapshot 过滤掉截断工具后 ToolUses 为空，
+	// 不代表客户端没收到过 tool_call_delta。非流式无回调、chat 流式忽略
+	// tool_call_delta，均不计为已交付（2026-10-17 复核 P0）。
+	Delivered bool
+}
+
+// isEmptyCompletedTurn reports a "politely closed but empty" turn: the
+// stream ended normally (no error frames, a termination signal) yet
+// carries neither text nor tool calls. Content filter / refusal are
+// legitimate silences and stay exempt.
+func isEmptyCompletedTurn(t Turn) bool {
+	// 已交付过内容的回合不判废：snapshot 可能因丢弃截断工具而变空，但客户端
+	// 已经收到过增量，重放会产生重复/错乱的工具调用（作者 P1）。
+	if t.Delivered {
+		return false
+	}
+	if strings.TrimSpace(t.Text) != "" || len(t.ToolUses) > 0 {
+		return false
+	}
+	switch strings.ToLower(t.StopReason) {
+	case "content_filter", "refusal":
+		return false
+	// 输出预算耗尽（length/max_tokens）且无正文是合法完成：推理模型可能把
+	// max_completion_tokens 全部用于 reasoning_content，换号只会让相同预算
+	// 再烧一遍，并丢失原始 reasoning/usage/length（作者 P2）。
+	case "length", "max_tokens":
+		return false
+	}
+	return true
 }
 
 type ToolUse struct {
@@ -780,6 +813,25 @@ func (c *Client) Complete(ctx context.Context, opts ChatOptions) (Result, error)
 		c.logUpstreamFailure(result.Turn.Errors[0], resp.StatusCode, body, opts, endpoint, domain, region, model)
 		return Result{}, fmt.Errorf("%s", result.Turn.Errors[0])
 	}
+	// Upstream soft truncation: the generation is aborted mid-flight but
+	// the stream closes politely - a synthesized finish_reason=stop +
+	// [DONE] with zero text, zero tool calls and a zeroed usage frame.
+	// The proxy sees a successful completion; the agent receives an empty
+	// turn and the session silently stalls. The predicate follows the
+	// OpenAI Agents SDK empty-turn validation family (which itself still
+	// lets the stop-shaped empty turn through, the gap closed here);
+	// content_filter / refusal remain legitimate silences.
+	if isEmptyCompletedTurn(result.Turn) {
+		// Diagnostic counters go to the WARN log only, never into the error
+		// string: downstream retry/cooldown classification is Contains-based
+		// substring matching (11101/11140/429/502...), and a bare numeric
+		// run could forge a match.
+		c.logUpstreamFailure(fmt.Sprintf("empty completed turn (finish=%q thinking_len=%d usage_prompt=%d)",
+			result.Turn.StopReason, len(result.Turn.Thinking), result.Turn.Usage.PromptTokens),
+			resp.StatusCode, body, opts, endpoint, domain, region, model)
+		return Result{}, fmt.Errorf("CodeBuddy chat completion upstream aborted with empty completed turn (finish=%q) [region=%s site=%s endpoint=%s domain=%s model=%s]",
+			result.Turn.StopReason, region, config.NormalizeSite(opts.Site), endpoint, domain, model)
+	}
 	result.DurationMs = time.Since(started).Milliseconds()
 	result.Status = resp.StatusCode
 	result.Model = model
@@ -962,8 +1014,18 @@ func (c *Client) readSSE(body io.Reader, opts ChatOptions) (Result, error) {
 	var (
 		eventCount int
 		deltaCount int
-		bytesRead  int64
-		dataBuf    strings.Builder
+		// sawContent: true once any text or tool-call delta has been forwarded
+		// to the client. Reasoning (thinking) deltas do not count - agent
+		// clients consume text + tool calls and treat reasoning as auxiliary
+		// display, so replaying after a thinking-only cut cannot duplicate
+		// anything the user saw.
+		// 用途=断流重放的保守判定（沿用原语义）。
+		sawContent bool
+		// delivered: 内容是否**真的下发给了客户端**（回调非空且该事件会被转发）。
+		// 空回合判定用它；与 sawContent 分开，避免把"解析到但没下发"当成已交付。
+		delivered bool
+		bytesRead int64
+		dataBuf   strings.Builder
 	)
 	flush := func() {
 		data := strings.TrimSpace(dataBuf.String())
@@ -985,6 +1047,31 @@ func (c *Client) readSSE(body io.Reader, opts ChatOptions) (Result, error) {
 			events = MapSSEEvent(payload)
 		}
 		for _, event := range events {
+			// sawContent 有两个消费者，语义不同，必须分开记：
+			//   1) 断流重放（readSSE 错误分支）：保守——只要解析到正文/工具就
+			//      不重放，避免客户端看到重复内容（沿用原语义）。
+			//   2) 空回合判定（Turn.Delivered）：严格——只有事件**真的下发给
+			//      客户端**才算已交付。非流式无回调、chat 流式忽略 tool_call_delta，
+			//      若用宽松口径会把截断工具导致的空回合放行成 200 空响应。
+			switch event.Type {
+			case "text_delta":
+				if event.Text != "" {
+					sawContent = true
+					if opts.OnDelta != nil || opts.OnEvent != nil {
+						delivered = true
+					}
+				}
+			case "tool_use":
+				sawContent = true
+				if opts.OnEvent != nil {
+					delivered = true
+				}
+			case "tool_call_delta":
+				sawContent = true
+				if opts.DeliverToolDeltas && opts.OnEvent != nil {
+					delivered = true
+				}
+			}
 			if event.Type == "text_delta" && event.Text != "" {
 				event.Text = fixer.Feed(event.Text)
 			}
@@ -1023,14 +1110,29 @@ func (c *Client) readSSE(body io.Reader, opts ChatOptions) (Result, error) {
 			break
 		}
 		if err != nil {
+			// The upstream stream was torn down by the transport (idle
+			// reclamation / connection reset) before any text or tool-call
+			// delta was forwarded. At this point the client has received at
+			// most the role frame, keep-alive comments and reasoning deltas
+			// (reasoning replay is harmless for agent clients), so a replay
+			// is invisible and the failover layer may redial on another
+			// account (see reRetryNextAccount). Once text/tools were
+			// delivered, a replay would duplicate visible content and stays
+			// out of scope.
+			if !sawContent {
+				return Result{}, fmt.Errorf("CodeBuddy chat completion stream reset before first content: %w", err)
+			}
 			return Result{}, err
 		}
 	}
+	turn := acc.snapshot(func() string {
+		return estimatePromptText(opts.Messages)
+	})
+	// 已交付状态必须带出 readSSE：即使 snapshot 过滤掉截断工具后为空，
+	// 客户端也可能已经收到过增量。
+	turn.Delivered = delivered
 	return Result{
-		// 上游已给 usage 时跳过整段 messages 估算，避免长上下文白烧 CPU。
-		Turn: acc.snapshot(func() string {
-			return estimatePromptText(opts.Messages)
-		}),
+		Turn:       turn,
 		Bytes:      bytesRead,
 		EventCount: eventCount,
 		DeltaCount: deltaCount,
@@ -1295,6 +1397,16 @@ func (a *accumulator) snapshot(promptFn func() string) Turn {
 	for _, frag := range a.fragments {
 		input := map[string]any{}
 		if args, ok := frag.Input["__args"].(string); ok && args != "" {
+			// The upstream stream was cut mid-arguments: wrapping the raw
+			// half-string as {"input": <half>} would emit a structurally
+			// valid tool call with fabricated arguments that an agent would
+			// then execute. Drop it and leave a WARN; if the turn ends up
+			// empty, the empty-turn guard takes over.
+			if looksTruncatedToolArgs(args) {
+				slog.Default().Warn("dropping truncated tool call arguments",
+					"tool", strutil.First(frag.Name, "?"), "args_len", len(args))
+				continue
+			}
 			input = normalizeToolInput(args)
 		} else {
 			for k, v := range frag.Input {
@@ -1670,6 +1782,25 @@ func firstText(values ...any) string {
 		}
 	}
 	return ""
+}
+
+// looksTruncatedToolArgs reports arguments that were cut mid-stream: they
+// start like JSON (object or array prefix) and the parse fails with an
+// unexpected end of input - the fingerprint of a stream teardown in the
+// middle of the arguments. Malformed-but-complete payloads (trailing
+// comma, single quotes, trailing garbage) are NOT truncation; they keep
+// the legacy {"input": ...} fallback, as do non-JSON string arguments.
+func looksTruncatedToolArgs(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" || (!strings.HasPrefix(t, "{") && !strings.HasPrefix(t, "[")) {
+		return false
+	}
+	var v any
+	err := json.Unmarshal([]byte(t), &v)
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "unexpected end of JSON input")
 }
 
 func normalizeToolInput(values ...any) map[string]any {
